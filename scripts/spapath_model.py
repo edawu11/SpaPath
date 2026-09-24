@@ -167,27 +167,12 @@ class NTXentLoss(nn.Module):
 
 
 def guassian_kernel(source, target, kernel_mul=2.0, kernel_num=5, fix_sigma=None):
-    """
-    Calculate the Gram kernel matrix.
-    - source: A data matrix with dimensions (sample_size_1 x feature_size), representing the first sample set.
-    - target: A data matrix with dimensions (sample_size_2 x feature_size), representing the second sample set.
-    - kernel_mul: This concept is somewhat unclear but appears to be related to calculating the bandwidth for each kernel.
-    - kernel_num: The number of kernels, indicating the use of multiple kernels.
-    - fix_sigma: Indicates whether to use a fixed standard deviation.
-
-    Returns: A matrix of size ((sample_size_1 + sample_size_2) x (sample_size_1 + sample_size_2)),
-             structured as:
-                            [   K_ss K_st
-                                K_ts K_tt ]
-             where K_ss and K_tt are the kernel matrices within the same sample sets, and K_st and K_ts are the
-             kernel matrices between the two different sample sets.
-    """
+    """Calculate a multi-bandwidth Gaussian Gram matrix."""
     device = source.device
     n_samples = int(source.size()[0]) + int(target.size()[0])
-    total = torch.cat([source, target], dim=0)  # merge
+    total = torch.cat([source, target], dim=0)
     L2_distance = torch.cdist(total, total, p=2).pow(2)
 
-    # Calculate the bandwidth for each kernel in a multi-kernel setup.
     if kernel_mul <= 0:
         raise ValueError("kernel_mul must be positive.")
     if kernel_num <= 0:
@@ -204,12 +189,11 @@ def guassian_kernel(source, target, kernel_mul=2.0, kernel_num=5, fix_sigma=None
     bandwidth /= kernel_mul ** (kernel_num // 2)
     bandwidth_list = [bandwidth * (kernel_mul**i) for i in range(kernel_num)]
 
-    # The formula for the Gaussian kernel: exp(-|x-y|/bandwidth)
     kernel_val = [
         torch.exp(-L2_distance / bandwidth_temp) for bandwidth_temp in bandwidth_list
     ]
 
-    return sum(kernel_val)  # Combine multiple kernels together.
+    return sum(kernel_val)
 
 
 def _is_st(data_type):
@@ -342,7 +326,6 @@ class Model:
         self.genename = self.adata_full.var_names
 
         self.section_ids = list(adata_type_map.keys())
-        # self.section_ids = section_ids
         self.n_slices = len(self.section_ids)
         if self.n_slices < 2:
             raise ValueError("integrate() requires at least 2 slices.")
@@ -399,14 +382,6 @@ class Model:
                 torch.from_numpy(X_hvg.copy()).float().to(self.device)
             )
 
-            # if sp.issparse(self.batch_list[i].X):
-            #     self.batch_list[i].X = self.batch_list[i].X.toarray()
-            #     self.X_dict[i] = torch.from_numpy(self.batch_list[i].X.copy()).float().to(self.device)
-            #     self.node_feats_dict[i] = torch.from_numpy(self.batch_list[i][:,self.hvgs_shared].X).float().to(self.device)
-            # else:
-            #     self.X_dict[i] = torch.from_numpy(self.batch_list[i].X).float().to(self.device)
-            #     self.node_feats_dict[i] = torch.from_numpy(self.batch_list[i][:,self.hvgs_shared].X).float().to(self.device)
-
             if _is_st(self.data_type[i]):
 
                 graph = self.batch_list[i].obsp["graph"]
@@ -461,7 +436,6 @@ class Model:
                 diff = self.node_feats_dict[i] - X_recons
                 recon_loss = torch.mean(torch.sqrt(torch.sum(diff**2, dim=1) + 1e-8))
 
-                # recon_loss = F.mse_loss(X_recons, self.node_feats_dict[i])
                 loss_total = self.coef_recon * recon_loss
                 _assert_finite_tensor(f"pretrain slice {i} loss_total", loss_total)
                 self.optimizer_net[i].zero_grad(set_to_none=True)
@@ -615,7 +589,6 @@ class Model:
                 self.batch_list[i].obs[self.cluster_key] = y_pred_dict[i].copy()
                 y_combined_dict[i] = self.batch_list[i].obs[self.cluster_key]
 
-        ##### 使用DEC进行fine tune ####
         mu_dict = {}
         y_combined_last = {}
         cluster_size_diagnostics = {}
@@ -794,10 +767,6 @@ class Model:
                 "Add cluster size diagnostics into adata_full.uns['cluster_size_diagnostics']."
             )
 
-        # for i, bid in enumerate(self.section_ids):
-        #     mask = (self.adata_full.obs[self.batch_key] == bid).values
-        #     self.adata_full.obs.loc[mask, self.cluster_key] = y_combined_dict[i].values.astype(str)
-
         return self.adata_full
 
     def integrate(self, topk=30, temp=0.1):
@@ -860,8 +829,6 @@ class Model:
             self.net.parameters(), weight_decay=self.weight_decay, lr=self.lr
         )
         self.net.train()
-        early_stop_prev_state = None
-        early_stop_stable_count = 0
         for step in tqdm(range(self.n_training_steps), disable=not self.verbose):
             self.optimizer_net.zero_grad(set_to_none=True)
             Ss, X_recons = self.net(self.node_feats_dict, self.adj_matrix_dict)
@@ -896,9 +863,6 @@ class Model:
                     all_gene_embed_dict[i]["gene_list"] = s_gene_list
 
             if step % 20 == 0:
-                # =========================================================
-                # initialize persistent pools at first update
-                # =========================================================
                 if step == 0:
                     ref_tar_dict = {
                         i: pd.DataFrame(columns=["Ref", "Tar", "Score"])
@@ -906,7 +870,6 @@ class Model:
                     }
                     global_far_pool = []
 
-                # containers rebuilt at every update round
                 inter_in_dict = {}
                 inter_out_list = []
                 score_mat_dict = {}
@@ -915,17 +878,11 @@ class Model:
                 far_candidate_sets = []
                 ref_anchor_eligibility = {}
 
-                # target cluster labels
                 tar_clusters = (
                     self.batch_list[tar_index].obs[self.cluster_key].astype(int).values
                 )
 
-                # =========================================================
-                # 1. update pair pool for each ref
-                # =========================================================
-
                 for i in range(tar_index):
-                    # ---------- compute score matrix ----------
                     _, score_mat = spapath_utils.compute_gene_pvalue(
                         all_gene_embed_dict[i]["gene_list"],
                         all_gene_embed_dict[tar_index]["gene_list"],
@@ -977,13 +934,6 @@ class Model:
                     score_mat_dict[i] = score_mat
                     tar_label_to_idx_dict[i] = tar_label_to_idx
 
-                    # ---------- (optional) print score_mat ----------
-                    # print(f"Ref {i} score_mat:")
-                    # print(np.array2string(score_mat, formatter={'float_kind': lambda x: f"{x:.2f}"}))
-
-                    # =====================================================
-                    # 1a. clean old pair pool: keep only p < 0.05
-                    # =====================================================
                     if len(ref_tar_dict[i]) > 0:
 
                         def _pair_still_valid(row):
@@ -1009,11 +959,6 @@ class Model:
                             drop=True
                         )
 
-                    # =====================================================
-                    # 1b. add one new pair:
-                    # among pairs not already in pair_pool[i], pick the
-                    # smallest p-value; if < 0.05, add it
-                    # =====================================================
                     existing_pairs = (
                         set(
                             zip(
@@ -1037,7 +982,7 @@ class Model:
                             )
 
                     if len(candidate_pairs) > 0:
-                        candidate_pairs.sort(key=lambda x: x[2])  # ascending by p-value
+                        candidate_pairs.sort(key=lambda x: x[2])
                         best_ref_label, best_tar_label, best_p = candidate_pairs[0]
                         if best_p < 0.05:
                             new_entry = pd.DataFrame(
@@ -1051,11 +996,6 @@ class Model:
                                 [ref_tar_dict[i], new_entry], ignore_index=True
                             )
 
-                    # =====================================================
-                    # 1c. build far candidate set for this ref:
-                    # tar cluster t is candidate iff all p-values in col t > 0.05
-                    # and it is not already matched in this ref pair pool
-                    # =====================================================
                     if len(eligible_ref_row_idx) > 0:
                         eligible_score_mat = score_mat[eligible_ref_row_idx, :]
                         far_candidate_idx = np.where(
@@ -1070,9 +1010,6 @@ class Model:
 
                 self.adata_full.uns["ref_anchor_eligibility"] = ref_anchor_eligibility
 
-                # =========================================================
-                # 2. update global far pool
-                # =========================================================
                 matched_target_clusters = set()
                 for i in range(tar_index):
                     if len(ref_tar_dict[i]) > 0:
@@ -1081,23 +1018,14 @@ class Model:
                         )
 
                 if len(far_candidate_sets) > 0:
-                    # global_far_candidates = set.union(*far_candidate_sets)
-                    # To use the stricter intersection strategy instead, replace
-                    # the line above with the line below.
                     global_far_candidates = set.intersection(*far_candidate_sets)
                 else:
                     global_far_candidates = set()
 
-                # global_far_candidates -= matched_target_clusters
-
-                # ---------- clean old far pool ----------
-                # keep only those still in global far candidate set
                 global_far_pool = [
                     t for t in global_far_pool if t in global_far_candidates
                 ]
 
-                # ---------- add one new far ----------
-                # choose the one with largest mean p-value across all refs / all ref clusters
                 remaining_far_candidates = [
                     t for t in global_far_candidates if t not in global_far_pool
                 ]
@@ -1114,20 +1042,16 @@ class Model:
                             all_vals.extend(score_mat_dict[i][ref_rows, t_idx].tolist())
                         if len(all_vals) == 0:
                             continue
-                        # far_score_t = float(np.mean(all_vals)) #找均值最大的
-                        far_score_t = float(np.min(all_vals))  # 找最小值最大的
+                        far_score_t = float(np.min(all_vals))
                         far_scores.append((int(t), far_score_t))
 
                     if len(far_scores) > 0:
                         far_scores.sort(
                             key=lambda x: x[1], reverse=True
-                        )  # largest mean first
+                        )
                         best_far_t = far_scores[0][0]
                         global_far_pool.append(best_far_t)
 
-                # =========================================================
-                # 3. rebuild inter_in_dict from pair pools
-                # =========================================================
                 for i in range(tar_index):
                     inter_in_dict[i] = []
                     ref_list = []
@@ -1150,9 +1074,6 @@ class Model:
                     inter_in_dict[i].append(ref_list)
                     inter_in_dict[i].append(tar_list)
 
-                # =========================================================
-                # 4. rebuild inter_out_list from global far pool
-                # =========================================================
                 global_far_pool = sorted(list(set(global_far_pool)))
 
                 far_cell_indices = np.where(np.isin(tar_clusters, global_far_pool))[0]
@@ -1163,28 +1084,6 @@ class Model:
                 inter_out_list.append(far_cell_indices)
                 inter_out_list.append(non_far_cell_indices)
                 self.adata_full.uns["global_far_pool"] = global_far_pool
-                current_state = (
-                    tuple(sorted(matched_target_clusters)),
-                    tuple(sorted(global_far_pool)),
-                )
-
-                # if current_state == early_stop_prev_state:
-                #     early_stop_stable_count += 1
-                # else:
-                #     early_stop_prev_state = current_state
-                #     early_stop_stable_count = 1
-
-                # if early_stop_stable_count >= 4:
-                #     if self.verbose:
-                #         print(
-                #             f"Early stopping at step {step}: "
-                #             "Matched target clusters and Global far pool stayed unchanged "
-                #             "for 3 consecutive update rounds."
-                #         )
-                #     break
-                # =========================================================
-                # 5. debug prints
-                # =========================================================
                 if self.verbose and step % self.step_interval == 0:
                     print(
                         f"Integration step {step}: matched target clusters "
@@ -1248,13 +1147,9 @@ class Model:
                             margin = 2.0
                             tmp_pair_loss += torch.relu(mmd_pos - mmd_neg + margin)
 
-                            # tmp_pair_loss += mmd_pos - mmd_neg
-
                         inter_loss += tmp_pair_loss / n_pairs
                 if nozero_ref > 0:
                     inter_loss = inter_loss / nozero_ref
-                # else:
-                #     inter_loss = torch.tensor(0.0, device=Ss[0].device)
             else:
                 nozero_ref = 0
                 for i in range(tar_index):
@@ -1282,8 +1177,6 @@ class Model:
 
                 if nozero_ref > 0:
                     inter_loss = inter_loss / nozero_ref
-                # else:
-                #     inter_loss = torch.tensor(0.0, device=Ss[0].device)
             for i in range(self.n_slices):
                 labels = self.batch_list[i].obs[self.cluster_key].astype(int).values
                 labels = torch.from_numpy(labels).to(self.device)
@@ -1343,8 +1236,6 @@ class Model:
             self.adata_full.uns["pair_dict"][str(k)] = v
         dist_list = []
         for i in range(self.n_slices):
-            # adata_batch = self.adata_full[self.adata_full.obs[self.batch_key]==self.section_ids[i],].copy()
-
             adata_batch = self.batch_list[i].copy()
 
             if sp.issparse(adata_batch.X):

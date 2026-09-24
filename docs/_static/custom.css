@@ -1,0 +1,16 @@
+.wy-nav-content {
+    max-width: 1050px;
+}
+
+.wy-side-nav-search {
+    background-color: #245b6b;
+}
+
+.rst-content img {
+    height: auto;
+}
+
+.wy-table-responsive table td,
+.wy-table-responsive table th {
+    white-space: normal;
+}

@@ -8,6 +8,7 @@ __pycache__/
 
 # Virtual environments
 .venv/
+.venv-docs/
 venv/
 env/
 
@@ -29,3 +30,13 @@ dist/
 .idea/
 .DS_Store
 Thumbs.db
+
+# Local data and analysis output
+/data
+/outputs/
+
+# Private manuscript correspondence and backups
+*[Cc][Oo][Vv][Ee][Rr]*[Ll][Ee][Tt][Tt][Ee][Rr]*
+
+# Documentation build output
+/docs/_build/

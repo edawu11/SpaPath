@@ -83,7 +83,6 @@ def preprocess(
     adata_type = list(adata_type_map.values())
     assert len(adata_type) == len(adata_list)
 
-    # 对每个adata进行质控，去细胞和去基因
     ads = []
     for i, adata_st in enumerate(adata_list):
         if not sp.issparse(adata_st.X):
@@ -103,16 +102,13 @@ def preprocess(
         adata_list[i] = adata_st
         ads.append(adata_st)
 
-    # 保存tar_adata（最后一个数据集的原始副本，包含所有基因）
     adata_tar = adata_list[-1].copy()
 
-    # 保留共有基因，concat
     adata_full = ad.concat(ads, join="inner")
     del ads
     shared_gene = adata_full.var_names
     print(f"Find {len(shared_gene)} shared genes among datasets.")
 
-    # 过滤共表达基因（可选），直接在 adata_full 上按 batch 分组
     if ifco_expressed_genes:
         expr_ratio_per_batch = []
         for bid in adata_full.obs["batch"].unique():
@@ -135,104 +131,26 @@ def preprocess(
     else:
         coexp_gene = shared_gene
 
-    # 将 adata_full 统一裁剪到 coexp_gene 或者 shared_gene
     adata_full = adata_full[:, coexp_gene].copy()
 
     target_sum = 1e3 if len(coexp_gene) < 1e3 else 1e4
 
-    # 标准化 adata_full（只做一次）
     print("Normalize data...")
     adata_full.layers["counts"] = adata_full.X.copy()
     sc.pp.normalize_total(adata_full, target_sum=target_sum, inplace=True)
     sc.pp.log1p(adata_full)
 
-    # 不对ATAC进行同样操作的标准化
-    # normed_ads = []
-    # batch_ids = sorted(adata_full.obs.index.str.extract(r'-(\d+)$')[0].unique(), key=int)
-    # for i, bid in enumerate(batch_ids):
-    #     mask = adata_full.obs.index.str.endswith(f"-{bid}")
-    #     adata_batch = adata_full[mask].copy()
-    #     if adata_type[i] != 'scATAC':
-    #         sc.pp.normalize_total(adata_batch, target_sum=target_sum, inplace=True)
-    #         sc.pp.log1p(adata_batch)
-    #     normed_ads.append(adata_batch)
-    # adata_full = ad.concat(normed_ads)
-    # del normed_ads
-
-    # 计算HVG（使用batch_key避免batch effect影响）
     sc.pp.highly_variable_genes(
         adata_full, n_top_genes=full_num_hvgs, batch_key="batch"
     )
     hvgs_shared = sorted(adata_full.var_names[adata_full.var.highly_variable].tolist())
-    # hvgs_shared = sorted(adata_full.var_names[adata_full.var.highly_variable_intersection].tolist())
     adata_full.uns["hvgs_shared"] = hvgs_shared
     print(f"Find {len(hvgs_shared)} shared highly variable genes among datasets.")
 
-    # hvg_dict = {}
-    # for i, b in enumerate(adata_full.obs["batch"].unique()):
-    #     adata_b = adata_full[adata_full.obs["batch"] == b].copy()
-    #     sc.pp.highly_variable_genes(
-    #         adata_b,
-    #         n_top_genes=full_num_hvgs
-    #     )
-    #     hvg_dict[i] = sorted(
-    #         adata_b.var_names[adata_b.var["highly_variable"]].tolist()
-    #     )
-    # adata_full.uns["hvg_dict"] = hvg_dict
-
-    # 处理 tar_adata：裁剪到 coexp_gene 后 normalize（只做一次）
     tar_target_sum = 1e3 if adata_tar.shape[1] < 1e3 else 1e4
     adata_tar.layers["counts"] = adata_tar.X.copy()
     sc.pp.normalize_total(adata_tar, target_sum=tar_target_sum, inplace=True)
     sc.pp.log1p(adata_tar)
-
-    #     hvgs_shared = None
-    #     for i in range(len(adata_list)):
-    #         adata_list[i] = adata_list[i][:, coexp_gene].copy()
-
-    #         if adata_type[i] != 'scATAC':
-    #             sc.pp.highly_variable_genes(
-    #                 adata_list[i],
-    #                 flavor='seurat_v3',
-    #                 n_top_genes=full_num_hvgs
-    #             )
-
-    #             hvgs = adata_list[i].var_names[
-    #                 adata_list[i].var.highly_variable
-    #             ]
-
-    #             if hvgs_shared is None:
-    #                 hvgs_shared = hvgs
-    #             else:
-    #                 hvgs_shared = hvgs_shared.intersection(hvgs)
-
-    #     if hvgs_shared is None:
-    #         raise ValueError("No scRNA or ST batch found for HVG calculation.")
-
-    #     hvgs_shared = sorted(hvgs_shared)
-
-    #     adata_full.uns['hvgs_shared'] = hvgs_shared
-    #     print("Find", str(len(hvgs_shared)), "shared highly variable genes among datasets.")
-
-    #     print("Normalize data...")
-    #     if adata_list[0].shape[1] < 1e3:
-    #         target_sum = 1e3
-    #     else:
-    #         target_sum = 1e4
-
-    #     for i in range(len(adata_list)):
-    #         if adata_type[i] == 'scATAC':
-    #             continue
-    #         else:
-    #             sc.pp.normalize_total(adata_list[i], target_sum=target_sum, inplace=True)
-    #             sc.pp.log1p(adata_list[i])
-
-    #     if tar_adata.shape[1] < 1e3:
-    #         target_sum = 1e3
-    #     else:
-    #         target_sum = 1e4
-    #     sc.pp.normalize_total(tar_adata, target_sum=target_sum, inplace=True)
-    #     sc.pp.log1p(tar_adata)
 
     return adata_full, adata_tar
 
@@ -267,7 +185,7 @@ def build_graph_GAT_plus(adata_full, adata_type_map: dict, K=8, img_threshold=0.
         nbrs = NearestNeighbors(
             n_neighbors=K + 1, algorithm="auto", metric="euclidean"
         ).fit(coords)
-        _, knn_indices = nbrs.kneighbors(coords)  # shape: (n_cells, K+1)，含自身
+        _, knn_indices = nbrs.kneighbors(coords)
 
         row_indices_list = []
         col_indices_list = []
@@ -408,86 +326,6 @@ def build_graph_GAT(adata_full, adata_type=["ST", "ST"], K=8, img_threshold=0.0)
     return adata_list
 
 
-# def build_graph_GAT(adata_list,
-#                     adata_type=['ST', 'ST'],
-#                     K=10,
-#                     img_threshold=0.0):
-
-#     print("Start building graphs...")
-
-#     for i, adata_st in enumerate(adata_list):
-#         current_type = adata_type[i]
-#         n_cells = adata_st.shape[0]
-
-#         if current_type in ['sc', 'scATAC']:
-#             adata_st.obsm["graph"] = sp.csr_matrix((n_cells, n_cells), dtype=int)
-#             print(f"Skipping spatial graph for batch {i} ({current_type})")
-#             continue
-
-#         print(f"Building sparse graph for batch {i} ({current_type}) using NearestNeighbors...")
-
-#         if 'spatial' not in adata_st.obsm:
-#              raise KeyError(f"Batch {i} is missing .obsm['spatial'].")
-
-#         coords = adata_st.obsm['spatial']
-
-#         nbrs = NearestNeighbors(n_neighbors=K+1, algorithm='auto', metric='euclidean').fit(coords)
-#         _, knn_indices = nbrs.kneighbors(coords)
-
-
-#         row_indices_list = []
-#         col_indices_list = []
-
-#         if current_type == 'ST':
-#             row_indices_list = np.repeat(np.arange(n_cells), K+1)
-#             col_indices_list = knn_indices.flatten()
-
-#         elif current_type == 'ST_with_HE':
-#             if 'image_embedding' not in adata_st.obsm:
-#                 raise ValueError(f"Batch {i} is 'ST_with_HE' but .obsm['image_embedding'] is missing.")
-
-#             img_emb = adata_st.obsm['image_embedding']
-#             norm_img_emb = normalize(img_emb, axis=1)
-
-#             cosim_values = []
-
-#             for row_idx, neighbors in enumerate(knn_indices):
-#                 curr_vec = norm_img_emb[row_idx]
-#                 neighbor_vecs = norm_img_emb[neighbors]
-#                 sims = np.dot(neighbor_vecs, curr_vec)
-#                 cosim_values.extend(sims)
-#                 valid_mask = sims >= img_threshold
-#                 valid_neighbors = neighbors[valid_mask]
-
-#                 if len(valid_neighbors) > 0:
-#                     row_indices_list.extend([row_idx] * len(valid_neighbors))
-#                     col_indices_list.extend(valid_neighbors)
-
-#             if len(cosim_values) > 0:
-#                 quantiles = np.percentile(cosim_values, [0, 25, 50, 75, 100])
-#                 print(f"  Image similarity quantiles (neighbors only): {quantiles}")
-
-#         data = np.ones(len(row_indices_list), dtype=int)
-
-#         G_sparse = sp.csr_matrix(
-#             (data, (row_indices_list, col_indices_list)),
-#             shape=(n_cells, n_cells)
-#         )
-
-#         adata_st.obsm["graph"] = G_sparse
-
-#         avg_neighbors = G_sparse.sum(axis=1).mean()
-#         print(f"  Average neighbors for Slice {i}: {avg_neighbors-1:.2f}")
-
-#         try:
-#             pair_dist_cos = pairwise_distances(adata_st.X, metric="cosine")
-#             adata_st.obsm["graph_cos"] = 1 - pair_dist_cos
-#         except MemoryError:
-#             print("  Warning: MemoryError when computing full gene expression cosine matrix. Skipping graph_cos.")
-
-#     return adata_list
-
-
 def search_res(
     adata,
     embed_key,
@@ -528,16 +366,6 @@ def search_res(
     return y_pred.astype(str)
 
 
-#     gm = GaussianMixture(n_components=target_n,
-#                      covariance_type='tied',
-#                      init_params='kmeans',
-#                      random_state=seed,
-#                      n_init=5)
-#     y_pred = gm.fit_predict(adata.obsm[embed_key])
-#     print(f"Did not find exact match, use gaussian clustering")
-#     return y_pred.astype(str)
-
-
 def gene_embed_weight(X, ce_cell, adj=None, c=1.0):
     X = X.T
     if adj is None:
@@ -547,8 +375,6 @@ def gene_embed_weight(X, ce_cell, adj=None, c=1.0):
         sumW = np.sum(X, axis=1, keepdims=True) + 1e-8
         weight = X / sumW
         return weight @ ce_cell
-        # weight = calculate_tfidf_weights(X)
-        # return np.dot(weight, ce_cell)
     else:
         indicatorX = (X != 0).astype(float)
         n_express = adj.dot(indicatorX.T) + c
@@ -561,7 +387,7 @@ def gene_embed_weight(X, ce_cell, adj=None, c=1.0):
 
 
 def gene_embed_weight_torch(X, ce_cell, adj=None, c=1.0):
-    X = X.T  # genes × cells
+    X = X.T
 
     if adj is None:
         sumW = torch.sum(X, dim=1, keepdim=True) + 1e-8
@@ -579,9 +405,6 @@ def gene_embed_weight_torch(X, ce_cell, adj=None, c=1.0):
 
 
 def cell_to_gene_pdistance(cell_embed, gene_embed, eta=1e-10):
-    # cell_embed = normalize(cell_embed, norm='l2', axis=1)
-    # gene_embed = normalize(gene_embed, norm='l2', axis=1)
-
     An = np.sum(cell_embed**2, axis=1, keepdims=True)
     Bn = np.sum(gene_embed**2, axis=1, keepdims=True)
     C = -2 * np.dot(cell_embed, gene_embed.T)
@@ -695,8 +518,6 @@ def select_sig_genes(
     expr_prop_cutoff=0.1,
     ntop_max=200,
     overlap_max=1,
-    # rm_mito_ribo=False,
-    # species="ms"
 ):
 
     cell_label_vec = adata.obs[label_key].astype(str)
@@ -733,15 +554,6 @@ def select_sig_genes(
         final_idx = filtered_indices[sorted_idx]
 
         gene_names = genes_use[final_idx]
-
-        # if rm_mito_ribo:
-        #     mito_pattern = r"^(mt-|Mt-)" if species == "ms" else r"^MT-"
-        #     ribo_pattern = r"^(Rps|Rpl)" if species == "ms" else r"^(RPS|RPL)"
-        #     is_mito = np.char.startswith(gene_names, tuple(["mt-", "Mt-", "MT-"]))
-        #     is_ribo = np.char.startswith(gene_names, tuple(["Rps", "Rpl", "RPS", "RPL"]))
-        #     keep_mask = ~(is_mito | is_ribo)
-        #     gene_names = gene_names[keep_mask]
-        #     final_idx = final_idx[keep_mask]
 
         ref_sig_list[label] = {
             "genes": gene_names.tolist(),
@@ -1151,12 +963,398 @@ def plot_gene_expression(
     figure.tight_layout()
     if save is not None:
         figure.savefig(save, dpi=dpi, bbox_inches="tight")
-        print(f"Gene-expression plot was saved to {save}.")
     if show:
         plt.show()
         return None
 
     return figure
+
+
+def load_tc_le_gene_sets(
+    gene_table,
+    gene_column="Gene",
+    score_column="sample_2",
+):
+    """Load TC and LE gene sets from a signed gene-score table."""
+    if isinstance(gene_table, (str, os.PathLike)):
+        gene_table = pd.read_csv(gene_table)
+    elif isinstance(gene_table, pd.DataFrame):
+        gene_table = gene_table.copy()
+    else:
+        raise TypeError("gene_table must be a path or a pandas DataFrame.")
+
+    required_columns = {gene_column, score_column}
+    missing_columns = required_columns.difference(gene_table.columns)
+    if missing_columns:
+        raise KeyError(
+            "Missing TC/LE gene-table columns: "
+            + ", ".join(sorted(missing_columns))
+        )
+
+    gene_table[score_column] = pd.to_numeric(
+        gene_table[score_column], errors="coerce"
+    )
+    gene_table = gene_table.dropna(subset=[gene_column, score_column]).copy()
+    gene_table[gene_column] = gene_table[gene_column].astype(str)
+    gene_table = gene_table.drop_duplicates(subset=gene_column)
+
+    gene_sets = {
+        "TC": gene_table.loc[
+            gene_table[score_column] > 0, gene_column
+        ].tolist(),
+        "LE": gene_table.loc[
+            gene_table[score_column] <= 0, gene_column
+        ].tolist(),
+    }
+    if not gene_sets["TC"] or not gene_sets["LE"]:
+        raise ValueError("Both TC and LE gene sets must contain at least one gene.")
+    return gene_sets
+
+
+def calculate_distance_enrichment(
+    adata,
+    gene_sets,
+    dist_key="cell_gene_dist",
+    n_permutations=5000,
+    min_genes=5,
+    seed=123,
+    fdr_method="fdr_bh",
+    alpha=0.05,
+    verbose=True,
+):
+    """Calculate observation-level gene-set enrichment from cell-gene distances."""
+    if dist_key not in adata.layers:
+        raise KeyError(f"adata.layers['{dist_key}'] was not found.")
+    if n_permutations <= 0:
+        raise ValueError("n_permutations must be positive.")
+    if min_genes <= 0:
+        raise ValueError("min_genes must be positive.")
+
+    distance_matrix = adata.layers[dist_key]
+    n_observations, n_genes = distance_matrix.shape
+    gene_names = adata.var_names.astype(str).to_numpy()
+    gene_index = {gene: index for index, gene in enumerate(gene_names)}
+
+    matched_indices = {}
+    matched_genes = {}
+    for name, genes in gene_sets.items():
+        unique_genes = list(dict.fromkeys(map(str, genes)))
+        current_genes = [gene for gene in unique_genes if gene in gene_index]
+        if len(current_genes) >= min_genes:
+            matched_genes[str(name)] = current_genes
+            matched_indices[str(name)] = np.array(
+                [gene_index[gene] for gene in current_genes], dtype=int
+            )
+
+    if not matched_indices:
+        raise ValueError(
+            "No gene sets retained enough genes after matching adata.var_names."
+        )
+
+    def sum_selected_genes(indices):
+        values = distance_matrix[:, indices].sum(axis=1)
+        if sp.issparse(values):
+            values = values.toarray()
+        return np.asarray(values).ravel().astype(float)
+
+    observed = pd.DataFrame(
+        {
+            name: sum_selected_genes(indices)
+            for name, indices in matched_indices.items()
+        },
+        index=adata.obs_names,
+    )
+    pathway_names = list(matched_indices)
+    p_values = pd.DataFrame(
+        np.nan, index=adata.obs_names, columns=pathway_names
+    )
+    z_scores = pd.DataFrame(
+        np.nan, index=adata.obs_names, columns=pathway_names
+    )
+
+    pathways_by_size = {}
+    for name, indices in matched_indices.items():
+        pathways_by_size.setdefault(len(indices), []).append(name)
+
+    rng = np.random.default_rng(seed)
+    size_iterator = pathways_by_size.items()
+    if verbose:
+        size_iterator = tqdm(
+            size_iterator,
+            total=len(pathways_by_size),
+            desc="Calculating distance enrichment",
+        )
+
+    for gene_set_size, names in size_iterator:
+        null_distribution = np.empty(
+            (n_observations, n_permutations), dtype=np.float32
+        )
+        for permutation_index in range(n_permutations):
+            random_indices = rng.choice(
+                n_genes, size=gene_set_size, replace=False
+            )
+            null_distribution[:, permutation_index] = sum_selected_genes(
+                random_indices
+            )
+
+        null_mean = null_distribution.mean(axis=1)
+        null_std = null_distribution.std(axis=1, ddof=1)
+        null_std[null_std == 0] = np.nan
+
+        for name in names:
+            observed_values = observed[name].to_numpy(dtype=float)
+            p_values[name] = (
+                (null_distribution <= observed_values[:, None]).sum(axis=1) + 1
+            ) / (n_permutations + 1)
+            z_scores[name] = (null_mean - observed_values) / null_std
+
+    adjusted_p_values = pd.DataFrame(
+        np.nan, index=p_values.index, columns=p_values.columns
+    )
+    for observation in p_values.index:
+        current_p_values = p_values.loc[observation]
+        valid = current_p_values.notna()
+        if valid.any():
+            adjusted_p_values.loc[observation, valid] = multipletests(
+                current_p_values.loc[valid].to_numpy(dtype=float),
+                method=fdr_method,
+            )[1]
+
+    return {
+        "p_values": p_values,
+        "adjusted_p_values": adjusted_p_values,
+        "significant": adjusted_p_values < alpha,
+        "z_scores": z_scores,
+        "observed_distances": observed,
+        "matched_genes": matched_genes,
+    }
+
+
+def calculate_tc_le_enrichment(
+    adata,
+    gene_table,
+    label_key="pred_label",
+    pathological_label="Pathological regions",
+    dist_key="cell_gene_dist",
+    gene_column="Gene",
+    score_column="sample_2",
+    n_permutations=5000,
+    min_genes=5,
+    seed=123,
+    alpha=0.05,
+    output_score_key="TC_to_LE_score",
+    verbose=True,
+):
+    """Calculate TC, LE, and TC-to-LE enrichment scores in pathological regions."""
+    if label_key not in adata.obs:
+        raise KeyError(f"adata.obs['{label_key}'] was not found.")
+
+    pathological_mask = adata.obs[label_key].astype(str) == pathological_label
+    if not pathological_mask.any():
+        raise ValueError(
+            f"No observations were found for label '{pathological_label}'."
+        )
+
+    gene_sets = load_tc_le_gene_sets(
+        gene_table=gene_table,
+        gene_column=gene_column,
+        score_column=score_column,
+    )
+    pathological_data = adata[pathological_mask].copy()
+    results = calculate_distance_enrichment(
+        adata=pathological_data,
+        gene_sets=gene_sets,
+        dist_key=dist_key,
+        n_permutations=n_permutations,
+        min_genes=min_genes,
+        seed=seed,
+        alpha=alpha,
+        verbose=verbose,
+    )
+
+    required_programs = {"TC", "LE"}
+    missing_programs = required_programs.difference(results["z_scores"].columns)
+    if missing_programs:
+        raise ValueError(
+            "The following gene programs did not retain enough matched genes: "
+            + ", ".join(sorted(missing_programs))
+        )
+
+    score_index = results["z_scores"].index
+    tc_scores = results["z_scores"]["TC"]
+    le_scores = results["z_scores"]["LE"]
+    transition_scores = le_scores - tc_scores
+
+    for key in ("TC_score", "LE_score", output_score_key):
+        adata.obs[key] = np.nan
+    adata.obs.loc[score_index, "TC_score"] = tc_scores
+    adata.obs.loc[score_index, "LE_score"] = le_scores
+    adata.obs.loc[score_index, output_score_key] = transition_scores
+
+    results["transition_scores"] = transition_scores.rename(output_score_key)
+    return results
+
+
+def _significance_label(p_value):
+    if p_value < 0.001:
+        return "***"
+    if p_value < 0.01:
+        return "**"
+    if p_value < 0.05:
+        return "*"
+    return "ns"
+
+
+def plot_tc_le_violin(
+    adata,
+    score_key="TC_to_LE_score",
+    group_key="CellType",
+    predicted_label_key="pred_label",
+    truth_label_key="truth_label",
+    pathological_label="Pathological regions",
+    group_order=None,
+    comparisons=None,
+    palette=None,
+    save=None,
+    dpi=300,
+    show=True,
+):
+    """Plot TC-to-LE scores by ground-truth pathological tissue class."""
+    required_columns = {
+        score_key,
+        group_key,
+        predicted_label_key,
+        truth_label_key,
+    }
+    missing_columns = required_columns.difference(adata.obs.columns)
+    if missing_columns:
+        raise KeyError(
+            "Missing observation columns: " + ", ".join(sorted(missing_columns))
+        )
+
+    if group_order is None:
+        group_order = ["core", "transitory", "edge"]
+    if comparisons is None:
+        comparisons = [("core", "transitory"), ("transitory", "edge")]
+    if palette is None:
+        palette = {
+            "core": "#E09F3E",
+            "transitory": "#C8553D",
+            "edge": "#8E3B46",
+        }
+
+    plot_data = adata.obs.loc[
+        adata.obs[predicted_label_key].astype(str).eq(pathological_label)
+        & adata.obs[truth_label_key].astype(str).eq(pathological_label),
+        [group_key, score_key],
+    ].dropna()
+    plot_data = plot_data.loc[plot_data[group_key].astype(str).isin(group_order)].copy()
+    plot_data[group_key] = pd.Categorical(
+        plot_data[group_key].astype(str), categories=group_order, ordered=True
+    )
+
+    group_counts = plot_data[group_key].value_counts()
+    empty_groups = [group for group in group_order if group_counts.get(group, 0) == 0]
+    if empty_groups:
+        raise ValueError(
+            "No observations were available for groups: "
+            + ", ".join(empty_groups)
+        )
+
+    with sns.axes_style("white"):
+        figure, axis = plt.subplots(figsize=(3.2, 3.0))
+        sns.violinplot(
+            data=plot_data,
+            x=group_key,
+            y=score_key,
+            hue=group_key,
+            order=group_order,
+            hue_order=group_order,
+            palette=palette,
+            legend=False,
+            width=0.4,
+            inner="box",
+            linewidth=1.2,
+            ax=axis,
+        )
+
+    score_min = plot_data[score_key].min()
+    score_max = plot_data[score_key].max()
+    score_range = score_max - score_min
+    if not np.isfinite(score_range) or score_range == 0:
+        score_range = 1.0
+
+    comparison_results = []
+    bracket_step = score_range * 0.08
+    bracket_height = score_range * 0.025
+    for comparison_index, (group_one, group_two) in enumerate(comparisons):
+        if group_one not in group_order or group_two not in group_order:
+            raise ValueError("All comparison groups must be present in group_order.")
+        values_one = plot_data.loc[
+            plot_data[group_key] == group_one, score_key
+        ].astype(float)
+        values_two = plot_data.loc[
+            plot_data[group_key] == group_two, score_key
+        ].astype(float)
+        statistic, p_value = stats.mannwhitneyu(
+            values_one, values_two, alternative="two-sided"
+        )
+        significance = _significance_label(p_value)
+        comparison_results.append(
+            {
+                "Group_1": group_one,
+                "Group_2": group_two,
+                "Mann_Whitney_U": statistic,
+                "P_value": p_value,
+                "Significance": significance,
+            }
+        )
+
+        x_one = group_order.index(group_one)
+        x_two = group_order.index(group_two)
+        y_position = score_max + (comparison_index + 1) * bracket_step
+        axis.plot(
+            [x_one, x_one, x_two, x_two],
+            [
+                y_position,
+                y_position + bracket_height,
+                y_position + bracket_height,
+                y_position,
+            ],
+            linewidth=1.2,
+            color="black",
+        )
+        axis.text(
+            (x_one + x_two) / 2,
+            y_position + bracket_height,
+            significance,
+            ha="center",
+            va="bottom",
+            fontsize=12,
+        )
+
+    axis.set_ylim(score_min - score_range * 0.10, score_max + score_range * 0.30)
+    axis.set_xlabel("")
+    axis.set_ylabel("TC-to-LE enrichment score", fontsize=11)
+    axis.set_xticks(
+        range(len(group_order)),
+        labels=[group.capitalize() for group in group_order],
+    )
+    axis.tick_params(
+        axis="both", direction="out", length=5, width=0.8, labelsize=11
+    )
+    for spine in axis.spines.values():
+        spine.set_visible(True)
+        spine.set_color("black")
+        spine.set_linewidth(1.2)
+
+    figure.tight_layout()
+    if save is not None:
+        figure.savefig(save, dpi=dpi, bbox_inches="tight")
+    if show:
+        plt.show()
+
+    return figure, pd.DataFrame(comparison_results)
 
 
 def self_compute_gene_pvalue(A_dict, background_genes):
@@ -1223,18 +1421,6 @@ def compute_gene_pvalue(A_dict, B_dict, background_genes):
     return p_values, fdr_matrix
 
 
-# def calculate_tfidf_weights(X):
-#     sum_per_gene = np.sum(X, axis=1, keepdims=True) + 1e-8
-#     tf = X / sum_per_gene
-#     n_cells = X.shape[1]
-#     n_cells_expressing_gene = np.sum(X > 0, axis=1) + 1
-#     idf = np.log(n_cells / n_cells_expressing_gene)
-#     tfidf_weights = tf * idf[:, np.newaxis]
-#     sum_tfidf = np.sum(tfidf_weights, axis=1, keepdims=True) + 1e-8
-#     final_weights = tfidf_weights / sum_tfidf
-#     return final_weights
-
-
 def detection(
     adata,
     embed,
@@ -1270,11 +1456,6 @@ def detection(
             adata_cond, embed, target_n=2, seed=seed
         ).astype(str)
 
-        # X_all = adata_all.obsm[embed]
-        # nbrs = NearestNeighbors(n_neighbors=neighbors+1).fit(X_all)
-        # _, indices_all = nbrs.kneighbors(X_all)
-        # is_normal_all = np.array(adata_all.obs[batch_key].isin(section_ids[:-1]))
-
         binary_labels = ["0", "1"]
 
         ratios = {}
@@ -1284,11 +1465,6 @@ def detection(
                 adata_all.obs_names.isin(adata_cluster.obs_names)
             )[0]
             hit_flags = []
-
-            # neighbor_indices = indices_all[cluster_indices, 1:]
-            # neighbor_is_normal = is_normal_all[neighbor_indices]
-            # has_normal_per_cell = np.any(neighbor_is_normal, axis=1)
-            # ratios[binary_label] = np.mean(has_normal_per_cell)
 
             for idx in cluster_indices:
                 neighbor_indices = indices_all[idx][1:]
@@ -1304,10 +1480,6 @@ def detection(
         all_above = True
 
     if all_above or strategy == "individual":
-        # X_all = adata_all.obsm[embed]
-        # nbrs = NearestNeighbors(n_neighbors=neighbors + 1).fit(X_all)
-        # _, indices_all = nbrs.kneighbors(X_all)
-
         cond_indices = np.where(adata_all.obs[batch_key] == section_ids[-1])[0]
         pad_flags = []
 
@@ -1474,7 +1646,327 @@ def plot_detection_umap(
 
     if save is not None:
         figure.savefig(save, dpi=dpi, bbox_inches="tight")
-        print(f"Detection UMAP was saved to {save}.")
+    if show:
+        plt.show()
+
+    return figure
+
+
+def _prepare_he_overlay(
+    adata,
+    image_path,
+    section_id,
+    batch_key,
+    spatial_key,
+    coordinate_scale,
+    crop_margin,
+):
+    """Load and crop an H&E image to the scaled spatial coordinates."""
+    image_path = os.fspath(image_path)
+    if not os.path.isfile(image_path):
+        raise FileNotFoundError(f"H&E image was not found: {image_path}")
+    if spatial_key not in adata.obsm:
+        raise KeyError(f"adata.obsm['{spatial_key}'] was not found.")
+    if crop_margin < 0:
+        raise ValueError("crop_margin must be non-negative.")
+
+    if section_id is None:
+        plot_adata = adata
+    else:
+        if batch_key not in adata.obs:
+            raise KeyError(f"adata.obs['{batch_key}'] was not found.")
+        section_mask = adata.obs[batch_key].astype(str) == str(section_id)
+        if not section_mask.any():
+            raise ValueError(f"No observations were found for section '{section_id}'.")
+        plot_adata = adata[section_mask]
+
+    image = plt.imread(image_path)
+    if image.ndim not in (2, 3):
+        raise ValueError("The H&E image must be a two- or three-dimensional array.")
+
+    coordinates = np.asarray(plot_adata.obsm[spatial_key], dtype=float).copy()
+    if coordinates.ndim != 2 or coordinates.shape[1] < 2:
+        raise ValueError(
+            f"adata.obsm['{spatial_key}'] must contain at least two columns."
+        )
+
+    scale = np.asarray(coordinate_scale, dtype=float)
+    if scale.ndim == 0:
+        scale = np.repeat(scale, 2)
+    if scale.shape != (2,) or not np.all(np.isfinite(scale)) or np.any(scale <= 0):
+        raise ValueError("coordinate_scale must contain one or two positive values.")
+    coordinates[:, :2] *= scale
+
+    image_height, image_width = image.shape[:2]
+    x_min = max(0, int(np.floor(coordinates[:, 0].min() - crop_margin)))
+    x_max = min(
+        image_width,
+        int(np.ceil(coordinates[:, 0].max() + crop_margin)) + 1,
+    )
+    y_min = max(0, int(np.floor(coordinates[:, 1].min() - crop_margin)))
+    y_max = min(
+        image_height,
+        int(np.ceil(coordinates[:, 1].max() + crop_margin)) + 1,
+    )
+    if x_max <= x_min or y_max <= y_min:
+        raise ValueError(
+            "The scaled spatial coordinates do not overlap the H&E image."
+        )
+
+    cropped_image = image[y_min:y_max, x_min:x_max]
+    cropped_coordinates = coordinates[:, :2] - np.array([x_min, y_min])
+    return plot_adata, cropped_image, cropped_coordinates
+
+
+def _resolve_he_point_size(
+    coordinates,
+    cropped_image_shape,
+    figsize,
+    point_size,
+    point_scale,
+):
+    """Resolve a marker area from the median spatial nearest-neighbor distance."""
+    if point_size is not None:
+        if point_size <= 0:
+            raise ValueError("point_size must be positive.")
+        return float(point_size)
+    if point_scale <= 0:
+        raise ValueError("point_scale must be positive.")
+    if coordinates.shape[0] < 2:
+        return 20.0
+
+    neighbor_model = NearestNeighbors(n_neighbors=2).fit(coordinates)
+    distances, _ = neighbor_model.kneighbors(coordinates)
+    median_neighbor_distance = float(np.median(distances[:, 1]))
+    image_height, image_width = cropped_image_shape[:2]
+    width_scale = float(figsize[0]) * 72 / image_width
+    height_scale = float(figsize[1]) * 72 / image_height
+    diameter_points = (
+        median_neighbor_distance
+        * min(width_scale, height_scale)
+        * point_scale
+    )
+    return max(diameter_points**2, 1.0)
+
+
+def _format_he_axis(axis, cropped_image):
+    axis.set_xlim(0, cropped_image.shape[1])
+    axis.set_ylim(cropped_image.shape[0], 0)
+    axis.set_axis_off()
+    axis.margins(0)
+    axis.set_position([0, 0, 1, 1])
+
+
+def plot_prediction_on_he(
+    adata,
+    image_path,
+    section_id=None,
+    batch_key="batch",
+    label_key="pred_label",
+    spatial_key="spatial",
+    label_palette=None,
+    coordinate_scale=1.0,
+    crop_margin=20,
+    image_alpha=0.8,
+    point_size=None,
+    point_scale=0.85,
+    point_alpha=1.0,
+    figsize=(3, 3),
+    show_legend=False,
+    save=None,
+    dpi=300,
+    show=True,
+):
+    """Overlay predicted region labels on a cropped H&E tissue image."""
+    if label_key not in adata.obs:
+        raise KeyError(f"adata.obs['{label_key}'] was not found.")
+    plot_adata, cropped_image, cropped_coordinates = _prepare_he_overlay(
+        adata=adata,
+        image_path=image_path,
+        section_id=section_id,
+        batch_key=batch_key,
+        spatial_key=spatial_key,
+        coordinate_scale=coordinate_scale,
+        crop_margin=crop_margin,
+    )
+    labels = plot_adata.obs[label_key].astype(str)
+    categories = sorted(labels.unique(), key=_label_sort_key)
+
+    default_palette = {
+        "Pathological regions": "#B6473F",
+        "Healthy-like regions": "#6DBBD1",
+    }
+    if label_palette is not None:
+        default_palette.update(label_palette)
+    colors = labels.map(default_palette).fillna("#7F7F7F").to_numpy()
+    resolved_point_size = _resolve_he_point_size(
+        coordinates=cropped_coordinates,
+        cropped_image_shape=cropped_image.shape,
+        figsize=figsize,
+        point_size=point_size,
+        point_scale=point_scale,
+    )
+
+    figure, axis = plt.subplots(figsize=figsize)
+    axis.imshow(cropped_image, alpha=image_alpha)
+    axis.scatter(
+        cropped_coordinates[:, 0],
+        cropped_coordinates[:, 1],
+        c=colors,
+        s=resolved_point_size,
+        alpha=point_alpha,
+        edgecolors="none",
+        rasterized=True,
+    )
+    _format_he_axis(axis, cropped_image)
+
+    if show_legend:
+        legend_handles = [
+            plt.Line2D(
+                [0],
+                [0],
+                marker="o",
+                linestyle="none",
+                markerfacecolor=default_palette.get(category, "#7F7F7F"),
+                markeredgecolor="none",
+                markersize=5,
+                label=category,
+            )
+            for category in categories
+        ]
+        axis.legend(
+            handles=legend_handles,
+            loc="lower left",
+            frameon=True,
+            framealpha=0.8,
+            fontsize=8,
+        )
+
+    if save is not None:
+        figure.savefig(
+            save,
+            dpi=dpi,
+            bbox_inches="tight",
+            pad_inches=0,
+            transparent=False,
+        )
+    if show:
+        plt.show()
+
+    return figure
+
+
+def plot_score_on_he(
+    adata,
+    image_path,
+    score_key,
+    section_id=None,
+    batch_key="batch",
+    label_key="pred_label",
+    focus_label="Pathological regions",
+    spatial_key="spatial",
+    coordinate_scale=1.0,
+    crop_margin=20,
+    image_alpha=0.8,
+    background_color="#6DBBD1",
+    cmap="Reds",
+    vmin=None,
+    vmax=None,
+    point_size=None,
+    point_scale=0.85,
+    point_alpha=1.0,
+    figsize=(3, 3),
+    colorbar=False,
+    save=None,
+    dpi=300,
+    show=True,
+):
+    """Overlay a continuous score for one predicted region on a cropped H&E image."""
+    required_columns = {score_key, label_key}
+    missing_columns = required_columns.difference(adata.obs.columns)
+    if missing_columns:
+        raise KeyError(
+            "Missing observation columns: " + ", ".join(sorted(missing_columns))
+        )
+
+    plot_adata, cropped_image, cropped_coordinates = _prepare_he_overlay(
+        adata=adata,
+        image_path=image_path,
+        section_id=section_id,
+        batch_key=batch_key,
+        spatial_key=spatial_key,
+        coordinate_scale=coordinate_scale,
+        crop_margin=crop_margin,
+    )
+    labels = plot_adata.obs[label_key].astype(str).to_numpy()
+    scores = pd.to_numeric(plot_adata.obs[score_key], errors="coerce").to_numpy()
+    focus_mask = labels == str(focus_label)
+    valid_focus_mask = focus_mask & np.isfinite(scores)
+    if not valid_focus_mask.any():
+        raise ValueError(
+            f"No finite '{score_key}' values were found for label '{focus_label}'."
+        )
+
+    resolved_point_size = _resolve_he_point_size(
+        coordinates=cropped_coordinates,
+        cropped_image_shape=cropped_image.shape,
+        figsize=figsize,
+        point_size=point_size,
+        point_scale=point_scale,
+    )
+    focus_scores = scores[valid_focus_mask]
+    if vmin is None:
+        vmin = float(np.min(focus_scores))
+    if vmax is None:
+        vmax = float(np.max(focus_scores))
+    if np.isclose(vmin, vmax):
+        vmin -= 0.5
+        vmax += 0.5
+    normalization = Normalize(vmin=vmin, vmax=vmax)
+
+    figure, axis = plt.subplots(figsize=figsize)
+    axis.imshow(cropped_image, alpha=image_alpha)
+    background_mask = ~focus_mask
+    if background_mask.any():
+        axis.scatter(
+            cropped_coordinates[background_mask, 0],
+            cropped_coordinates[background_mask, 1],
+            c=background_color,
+            s=resolved_point_size,
+            alpha=point_alpha,
+            edgecolors="none",
+            rasterized=True,
+        )
+    score_scatter = axis.scatter(
+        cropped_coordinates[valid_focus_mask, 0],
+        cropped_coordinates[valid_focus_mask, 1],
+        c=focus_scores,
+        cmap=cmap,
+        norm=normalization,
+        s=resolved_point_size,
+        alpha=point_alpha,
+        edgecolors="none",
+        rasterized=True,
+    )
+    _format_he_axis(axis, cropped_image)
+
+    if colorbar:
+        colorbar_artist = figure.colorbar(
+            score_scatter,
+            ax=axis,
+            fraction=0.035,
+            pad=0.01,
+        )
+        colorbar_artist.ax.tick_params(labelsize=8)
+
+    if save is not None:
+        figure.savefig(
+            save,
+            dpi=dpi,
+            bbox_inches="tight",
+            pad_inches=0,
+            transparent=False,
+        )
     if show:
         plt.show()
 
@@ -2019,30 +2511,12 @@ class CellTypeCCC:
 
             summaries.append(
                 {
-                    "Sender": sender_label,
-                    "Receiver": receiver_label,
                     "Direction": f"{sender_label} -> {receiver_label}",
                     "N_sender_cells": n_sender,
                     "N_receiver_cells": n_receiver,
                     "N_LR_pairs": len(statistics),
-                    "N_nominal_P_lt_0.05": int(
-                        (statistics["P_value"] < 0.05).sum()
-                    ),
                     "N_significant_LR_pairs": len(significant),
-                    "N_LR_used_for_cell_score": len(selected_pairs),
-                    "Selected_LR_Real_Sum": float(
-                        statistics.loc[selected_pairs, "Real_Sum"].sum()
-                    ),
-                    "Min_P_value": statistics["P_value"].min(),
                     "Min_P_adj": statistics["P_adj"].min(),
-                    "P_value_min_possible": (
-                        1 / (n_perms + 1) if n_perms > 0 else np.nan
-                    ),
-                    "Score_LR_source": score_lr_source,
-                    "Sender_score_key": sender_score_key,
-                    "Receiver_score_key": receiver_score_key,
-                    "All_stat_key": all_statistics_key,
-                    "Sig_stat_key": significant_statistics_key,
                 }
             )
 
@@ -2210,15 +2684,6 @@ def check_cluster_umap(adata_full, embed, celltype_key, section_ids, seed=123):
         y_pred = adata_batch.obs["cluster"].values
 
 
-#         ari = adjusted_rand_score(y_true, y_pred)
-#         nmi = normalized_mutual_info_score(y_true, y_pred)
-#         print(f"Section {section}: ARI={ari:.3f}, NMI={nmi:.3f}")
-
-#         results.append({'section': section, 'ARI': ari, 'NMI': nmi})
-
-# return results
-
-
 class CCC_Interact:
     def __init__(
         self,
@@ -2304,7 +2769,6 @@ class CCC_Interact:
             )
 
         print(f"Start Analyzing {len(self.lr_database)} L-R pairs...")
-        # print(f"Config: Mode={self.direction}, Bandwidth={kernel_bandwidth}")
 
         nc_coords = self.coords[self.other_idx]
         pad_coords = self.coords[self.core_idx]
@@ -2541,7 +3005,6 @@ class CCC_Interact:
                 root, ext = os.path.splitext(save)
                 final_save_name = f"{root}_{current_dir}{ext}"
                 stats_df.to_csv(final_save_name, index_label=cell_type_col)
-                print(f"Results saved to {final_save_name}")
 
             results_dict[current_dir] = stats_df
 
@@ -2715,7 +3178,6 @@ class CCC_plot:
                 plt.savefig(
                     final_save_name, dpi=dpi, bbox_inches="tight", pad_inches=0.1
                 )
-                print(f"Saved figure to {final_save_name}")
 
             plt.show()
             plt.close()
@@ -3018,7 +3480,6 @@ class CCC_plot:
                 root, ext = os.path.splitext(save)
                 final_save_name = f"{root}_{current_dir}_top{top_n}{ext}"
                 plt.savefig(final_save_name, dpi=dpi, bbox_inches="tight")
-                print(f"Saved figure to {final_save_name}")
 
             plt.show()
             plt.close()
@@ -3076,10 +3537,10 @@ class CCC_plot:
                     ax.set_xlim(x_min - padding, x_max + padding)
 
                     SIZE_LEVELS = {
-                        "p_0.001": 300,  # ***
-                        "p_0.01": 120,  # **
-                        "p_0.05": 50,  # *
-                        "ns": 20,  # ns
+                        "p_0.001": 300,
+                        "p_0.01": 120,
+                        "p_0.05": 50,
+                        "ns": 20,
                     }
 
                     sizes = []
@@ -3189,6 +3650,5 @@ class CCC_plot:
                 root, ext = os.path.splitext(save)
                 final_save = f"{root}_{current_dir}_bubble{ext}"
                 plt.savefig(final_save, dpi=300, bbox_inches="tight")
-                print(f"Saved: {final_save}")
 
             plt.show()
