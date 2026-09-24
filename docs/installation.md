@@ -14,4 +14,4 @@ jupyter lab
 
 The notebooks import the source modules from `scripts/`; no separate package installation is required. Launch Jupyter from the repository root, select the **Python (SpaPath)** kernel, and open a notebook from `notebook/`.
 
-Prepare the [example data](tutorials.md#data) before running. Figures are saved under `outputs/<dataset>/fig/`. BC functional enrichment requires internet access to Enrichr.
+Continue with the [tutorials](tutorials.md). Figures are saved under `outputs/<dataset>/fig/`. BC functional enrichment requires internet access to Enrichr.

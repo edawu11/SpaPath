@@ -2,7 +2,9 @@
 
 SpaPath identifies and characterizes pathological regions in spatial transcriptomics using healthy references from ST, scRNA-seq, scATAC-seq, or their combination.
 
-![SpaPath workflow](docs/_static/workflow.png)
+<p align="center">
+  <img src="docs/_static/workflow.png" alt="SpaPath workflow" width="600">
+</p>
 
 ## Installation
 
