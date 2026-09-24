@@ -5,12 +5,10 @@ Pathological-region detection and characterization in disease spatial transcript
 Start with the [overview](overview.md), follow the [installation guide](installation.md), or explore the [five example workflows](tutorials.md).
 
 ```{toctree}
-:maxdepth: 2
-:caption: Documentation
+:maxdepth: 1
 
 overview
 installation
-quickstart
 tutorials
 api
 ```

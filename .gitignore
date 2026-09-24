@@ -37,6 +37,8 @@ Thumbs.db
 
 # Private manuscript correspondence and backups
 *[Cc][Oo][Vv][Ee][Rr]*[Ll][Ee][Tt][Tt][Ee][Rr]*
+/Fig_1.pdf
 
 # Documentation build output
 /docs/_build/
+/docs/tutorials/*.ipynb
