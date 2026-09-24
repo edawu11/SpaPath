@@ -1,5 +1,6 @@
 import random
 import os
+import re
 import numpy as np
 import torch
 import pandas as pd
@@ -710,7 +711,7 @@ def select_sig_genes(
     distce_data = adata[:, genes_use].layers[dist_key]
 
     if sp.issparse(expr_data):
-        expr_data = expr_data.tocsr()
+        expr_data = expr_data.toarray()
     if sp.issparse(distce_data):
         distce_data = distce_data.toarray()
 
@@ -718,7 +719,7 @@ def select_sig_genes(
 
     for label in cell_IDs:
         idx = np.where(cell_label_vec == label)[0]
-        expr_prop = np.asarray((expr_data[idx, :] > 0).mean(axis=0)).ravel()
+        expr_prop = (expr_data[idx, :] > 0).mean(axis=0)
         distce_vals = distce_data[idx, :].mean(axis=0)
 
         mask = expr_prop > expr_prop_cutoff
@@ -788,6 +789,293 @@ def calculate_signature_genes(
     print(f"Top {n_display} signature genes for {target_label}:")
     print(signature_table.to_string(index=False))
     return signature_genes
+
+
+def run_signature_enrichment(
+    genes,
+    gene_sets=None,
+    group_name="Pathological regions",
+    organism="human",
+    adjusted_p_cutoff=0.05,
+    min_count=5,
+):
+    """Run Enrichr and retain significant terms with sufficient gene overlap."""
+    import gseapy as gp
+
+    if gene_sets is None:
+        gene_sets = [
+            "GO_Biological_Process_2025",
+            "MSigDB_Hallmark_2020",
+        ]
+
+    gene_list = pd.Series(genes).dropna().astype(str).drop_duplicates().tolist()
+    if not gene_list:
+        raise ValueError("At least one gene is required for enrichment analysis.")
+
+    enrichment = gp.enrichr(
+        gene_list=gene_list,
+        gene_sets=gene_sets,
+        organism=organism,
+        outdir=None,
+        cutoff=adjusted_p_cutoff,
+    )
+    results = enrichment.results.copy()
+    results["Adjusted P-value"] = pd.to_numeric(
+        results["Adjusted P-value"], errors="coerce"
+    )
+    results = results.loc[
+        results["Adjusted P-value"] < adjusted_p_cutoff
+    ].copy()
+    if results.empty:
+        return results
+
+    overlap = results["Overlap"].astype(str).str.split("/", expand=True)
+    overlap_count = pd.to_numeric(overlap[0], errors="coerce")
+    overlap_total = pd.to_numeric(overlap[1], errors="coerce")
+    results = results.loc[overlap_count >= min_count].copy()
+    if results.empty:
+        return results
+
+    results["Group"] = group_name
+    results["Count"] = overlap_count.loc[results.index].astype(int)
+    results["GeneRatio"] = results["Count"] / overlap_total.loc[results.index]
+    results["Term_Name"] = results["Term"].map(_extract_enrichment_term_name)
+    results["Term_Name_wrap"] = results["Term_Name"].map(
+        lambda term: _wrap_enrichment_label(term, width=32)
+    )
+    results["neglog10_adjP"] = -np.log10(
+        results["Adjusted P-value"].clip(lower=1e-300)
+    )
+    return results.reset_index(drop=True)
+
+
+def _extract_enrichment_term_name(term):
+    term = str(term)
+    if "(" in term:
+        return term[: term.rfind("(")].strip()
+    return term
+
+
+def _wrap_enrichment_label(text, width=42):
+    import textwrap
+
+    return "\n".join(
+        textwrap.wrap(
+            str(text),
+            width=width,
+            break_long_words=False,
+            break_on_hyphens=False,
+        )
+    )
+
+
+def _scale_enrichment_marker(value, value_min, value_max, size_min, size_max):
+    if value_min == value_max:
+        return (size_min + size_max) / 2
+    return size_min + (value - value_min) / (value_max - value_min) * (
+        size_max - size_min
+    )
+
+
+def plot_enrichment_bubble(
+    enrichment_results,
+    go_library="GO_Biological_Process_2025",
+    hallmark_library="MSigDB_Hallmark_2020",
+    save=None,
+    dpi=300,
+    show=True,
+):
+    """Plot significant GO and Hallmark enrichment terms as a bubble chart."""
+    from matplotlib.patches import Patch
+
+    required_columns = {
+        "Gene_set",
+        "Term",
+        "GeneRatio",
+        "Count",
+        "Adjusted P-value",
+    }
+    missing_columns = required_columns.difference(enrichment_results.columns)
+    if missing_columns:
+        raise KeyError(
+            "Missing enrichment columns: " + ", ".join(sorted(missing_columns))
+        )
+    if enrichment_results.empty:
+        raise ValueError("No enrichment results are available for plotting.")
+
+    plot_data = pd.concat(
+        [
+            enrichment_results.loc[enrichment_results["Gene_set"] == go_library],
+            enrichment_results.loc[
+                enrichment_results["Gene_set"] == hallmark_library
+            ],
+        ],
+        ignore_index=True,
+    )
+    if plot_data.empty:
+        raise ValueError("No GO or Hallmark enrichment results are available.")
+    plot_data["GeneRatio"] = pd.to_numeric(plot_data["GeneRatio"], errors="coerce")
+    plot_data["Count"] = pd.to_numeric(plot_data["Count"], errors="coerce")
+    plot_data["Adjusted P-value"] = pd.to_numeric(
+        plot_data["Adjusted P-value"], errors="coerce"
+    )
+    numeric_columns = ["GeneRatio", "Count", "Adjusted P-value"]
+    if plot_data[numeric_columns].isna().any().any():
+        raise ValueError("Enrichment plotting columns must contain numeric values.")
+
+    if "Term_Name" in plot_data:
+        display_terms = plot_data["Term_Name"].astype(str)
+    else:
+        display_terms = plot_data["Term"].map(_extract_enrichment_term_name)
+    plot_data["Label"] = display_terms.map(
+        lambda term: _wrap_enrichment_label(term, width=42)
+    )
+    plot_data["neglog10_adjP"] = -np.log10(
+        plot_data["Adjusted P-value"].clip(lower=1e-300)
+    )
+
+    y_step = 1.15
+    plot_data["y"] = np.arange(len(plot_data) - 1, -1, -1) * y_step + 1
+    count_min = plot_data["Count"].min()
+    count_max = plot_data["Count"].max()
+    plot_data["Size"] = plot_data["Count"].map(
+        lambda count: _scale_enrichment_marker(
+            count, count_min, count_max, 110, 520
+        )
+    )
+
+    figure, axis = plt.subplots(figsize=(8.4, 5.3))
+    figure.subplots_adjust(left=0.42, right=0.73, bottom=0.11, top=0.96)
+    cmap = LinearSegmentedColormap.from_list(
+        "single_purple_gradient", ["#F2EEF7", "#6A4C93"]
+    )
+    color_min = plot_data["neglog10_adjP"].min()
+    color_max = plot_data["neglog10_adjP"].max()
+    if np.isclose(color_min, color_max):
+        color_min -= 0.5
+        color_max += 0.5
+    norm = Normalize(vmin=color_min, vmax=color_max)
+
+    scatter = axis.scatter(
+        plot_data["GeneRatio"],
+        plot_data["y"],
+        s=plot_data["Size"],
+        c=plot_data["neglog10_adjP"],
+        cmap=cmap,
+        norm=norm,
+        edgecolor="black",
+        linewidth=1.0,
+        zorder=3,
+    )
+    axis.set_yticks(plot_data["y"])
+    axis.set_yticklabels(
+        plot_data["Label"], fontsize=10, rotation=0, ha="right", va="center"
+    )
+    axis.tick_params(axis="y", length=3, width=1.0, direction="out", pad=3)
+    axis.set_ylim(
+        plot_data["y"].min() - 0.55 * y_step,
+        plot_data["y"].max() + 0.55 * y_step,
+    )
+
+    tick_max = np.ceil(plot_data["GeneRatio"].max() / 0.01) * 0.01
+    tick_max = max(tick_max, 0.01)
+    axis.set_xlim(-0.004, tick_max + 0.015)
+    x_ticks = np.arange(0, tick_max + 0.02, 0.02)
+    axis.set_xticks(x_ticks)
+    axis.set_xticklabels([f"{tick:.2f}" for tick in x_ticks], fontsize=10)
+    axis.tick_params(axis="x", length=4, width=1.0, direction="out")
+
+    go_mask = plot_data["Gene_set"] == go_library
+    hallmark_mask = plot_data["Gene_set"] == hallmark_library
+    if go_mask.any() and hallmark_mask.any():
+        boundary = (
+            plot_data.loc[go_mask, "y"].min()
+            + plot_data.loc[hallmark_mask, "y"].max()
+        ) / 2
+        axis.axhline(
+            boundary,
+            color="gray",
+            linestyle="--",
+            linewidth=0.8,
+            alpha=0.8,
+            zorder=2,
+        )
+
+    axis.grid(axis="x", linestyle="--", linewidth=0.6, alpha=0.25, zorder=1)
+    for spine in axis.spines.values():
+        spine.set_visible(True)
+        spine.set_linewidth(1.4)
+        spine.set_color("black")
+
+    colorbar_axis = figure.add_axes([0.79, 0.72, 0.022, 0.18])
+    colorbar = figure.colorbar(scatter, cax=colorbar_axis)
+    colorbar.ax.tick_params(labelsize=9, width=1.0, length=3)
+    colorbar.outline.set_visible(True)
+    colorbar.outline.set_linewidth(1.2)
+    colorbar.outline.set_edgecolor("black")
+
+    gene_set_colors = {go_library: "#8DAA91", hallmark_library: "#D9B382"}
+    gene_set_handles = [
+        Patch(
+            facecolor=gene_set_colors[go_library],
+            edgecolor="black",
+            label="GOBP",
+            alpha=0.75,
+        ),
+        Patch(
+            facecolor=gene_set_colors[hallmark_library],
+            edgecolor="black",
+            label="Hallmark",
+            alpha=0.75,
+        ),
+    ]
+    figure.legend(
+        handles=gene_set_handles,
+        title="Gene set",
+        frameon=False,
+        fontsize=9.5,
+        title_fontsize=10.5,
+        loc="upper left",
+        bbox_to_anchor=(0.77, 0.61),
+        borderaxespad=0.0,
+        labelspacing=0.8,
+        handlelength=1.5,
+        handletextpad=0.8,
+    )
+
+    legend_counts = [5, 7, 9]
+    size_handles = [
+        axis.scatter(
+            [],
+            [],
+            s=_scale_enrichment_marker(count, count_min, count_max, 55, 200),
+            facecolor="white",
+            edgecolor="black",
+            linewidth=1.0,
+        )
+        for count in legend_counts
+    ]
+    figure.legend(
+        size_handles,
+        [str(count) for count in legend_counts],
+        title="Gene count",
+        scatterpoints=1,
+        frameon=False,
+        fontsize=9.5,
+        title_fontsize=10.5,
+        loc="upper left",
+        bbox_to_anchor=(0.77, 0.34),
+        borderaxespad=0.0,
+        labelspacing=1.0,
+        handletextpad=1.0,
+    )
+
+    if save is not None:
+        figure.savefig(save, dpi=dpi, bbox_inches="tight")
+    if show:
+        plt.show()
+        return None
+    return figure
 
 
 def plot_gene_expression(
@@ -1114,8 +1402,8 @@ def plot_detection_umap(
     sc.tl.umap(plot_adata, random_state=seed)
 
     region_palette = {
-        "Healthy-like regions": "#4C78A8",
-        "Pathological regions": "#E45756",
+        "Healthy-like regions": "#6DBBD1",
+        "Pathological regions": "#B6473F",
     }
     if label_palette is not None:
         region_palette.update(label_palette)
@@ -1284,6 +1572,574 @@ def subclustering(
             self.Batch_list[i].obs[self.cluster_key] = y_pred_dict[i].copy()
             y_combined_dict[i] = self.Batch_list[i].obs[self.cluster_key]
     print(y_combined_dict)
+
+
+def _safe_ccc_key(value):
+    """Convert a label into a key that is safe for AnnData mappings."""
+    value = re.sub(r"[^0-9a-zA-Z_]+", "_", str(value))
+    return re.sub(r"_+", "_", value).strip("_")
+
+
+def _cell_gene_distance_to_potential(distance_matrix, sigma=4.0):
+    """Convert cell-gene distances to potentials with a Gaussian kernel."""
+    sigma = float(sigma)
+    if sigma <= 0:
+        raise ValueError("potential_sigma must be positive.")
+
+    if sp.issparse(distance_matrix):
+        distance_matrix = distance_matrix.toarray()
+    else:
+        distance_matrix = np.asarray(distance_matrix)
+
+    return np.exp(-(distance_matrix**2) / (2 * sigma**2))
+
+
+def _score_ccc_lr_block(
+    sender_positions,
+    receiver_positions,
+    spatial_indicator,
+    ligand_potentials,
+    receptor_potentials,
+    lr_pair_names,
+    return_cell_scores=True,
+    return_cellcell_matrices=False,
+):
+    """Calculate ligand-receptor scores for one directed region pair."""
+    adjacency = spatial_indicator[np.ix_(sender_positions, receiver_positions)]
+    sender_ligands = ligand_potentials[sender_positions, :]
+    receiver_receptors = receptor_potentials[receiver_positions, :]
+
+    receiver_context = adjacency @ receiver_receptors
+    total_scores = np.sum(sender_ligands * receiver_context, axis=0)
+
+    if not return_cell_scores and not return_cellcell_matrices:
+        return total_scores
+
+    sender_scores = {}
+    receiver_scores = {}
+    if return_cell_scores:
+        sender_score_matrix = sender_ligands * receiver_context
+        sender_context = adjacency.T @ sender_ligands
+        receiver_score_matrix = receiver_receptors * sender_context
+        sender_scores = {
+            pair_name: sender_score_matrix[:, index].copy()
+            for index, pair_name in enumerate(lr_pair_names)
+        }
+        receiver_scores = {
+            pair_name: receiver_score_matrix[:, index].copy()
+            for index, pair_name in enumerate(lr_pair_names)
+        }
+
+    if not return_cellcell_matrices:
+        return total_scores, sender_scores, receiver_scores
+
+    cellcell_matrices = {
+        pair_name: (
+            sender_ligands[:, index, None]
+            * receiver_receptors[None, :, index]
+            * adjacency
+        )
+        for index, pair_name in enumerate(lr_pair_names)
+    }
+    return total_scores, sender_scores, receiver_scores, cellcell_matrices
+
+
+def _run_ccc_permutation(
+    permutation_id,
+    role_labels,
+    spatial_indicator,
+    ligand_potentials,
+    receptor_potentials,
+    lr_pair_names,
+    seed,
+):
+    """Run one region-label permutation while preserving group sizes."""
+    rng = np.random.default_rng(seed + permutation_id)
+    permuted_roles = rng.permutation(role_labels)
+    positions = np.arange(len(role_labels))
+    sender_positions = positions[permuted_roles == "sender"]
+    receiver_positions = positions[permuted_roles == "receiver"]
+
+    return _score_ccc_lr_block(
+        sender_positions=sender_positions,
+        receiver_positions=receiver_positions,
+        spatial_indicator=spatial_indicator,
+        ligand_potentials=ligand_potentials,
+        receptor_potentials=receptor_potentials,
+        lr_pair_names=lr_pair_names,
+        return_cell_scores=False,
+        return_cellcell_matrices=False,
+    )
+
+
+def estimate_spatial_scale(coords, spot_center_distance_um=100):
+    """Estimate micrometers per pixel from median nearest-neighbor distance."""
+    coordinates = np.asarray(coords)
+    if coordinates.ndim != 2 or coordinates.shape[0] < 2:
+        raise ValueError("At least two spatial coordinates are required.")
+
+    neighbor_model = NearestNeighbors(n_neighbors=2).fit(coordinates)
+    distances, _ = neighbor_model.kneighbors(coordinates)
+    median_neighbor_distance = float(np.median(distances[:, 1]))
+    if median_neighbor_distance <= 0:
+        raise ValueError("The median nearest-neighbor distance must be positive.")
+
+    micrometers_per_pixel = spot_center_distance_um / median_neighbor_distance
+    return micrometers_per_pixel, median_neighbor_distance
+
+
+def get_ccc_platform_params(platform, adata=None):
+    """Return spatial and permutation defaults for a supported platform."""
+    platform = str(platform).lower()
+    if platform == "cosmx":
+        return {
+            "q_um": 200,
+            "um_per_pixel": 0.12028,
+            "potential_sigma": 4.0,
+            "p_adj_threshold": 0.05,
+            "n_perms": 5000,
+            "n_jobs": 8,
+        }
+
+    if platform == "visium":
+        if adata is None:
+            raise ValueError("adata is required when platform='visium'.")
+        if "spatial" not in adata.obsm:
+            raise KeyError("adata.obsm['spatial'] is required for Visium data.")
+
+        micrometers_per_pixel, neighbor_distance = estimate_spatial_scale(
+            adata.obsm["spatial"], spot_center_distance_um=100
+        )
+        return {
+            "q_um": 200,
+            "um_per_pixel": micrometers_per_pixel,
+            "potential_sigma": 4.0,
+            "p_adj_threshold": 0.05,
+            "n_perms": 5000,
+            "n_jobs": 8,
+            "spot_center_distance_um": 100,
+            "visium_neighbor_distance_pixel": neighbor_distance,
+        }
+
+    raise ValueError("platform must be either 'cosmx' or 'visium'.")
+
+
+class CellTypeCCC:
+    """Calculate directed spatial ligand-receptor communication scores."""
+
+    def __init__(
+        self,
+        adata,
+        resource_name="cellchatdb",
+        dist_key="cell_gene_dist",
+        spatial_key="spatial",
+        label_key="pred_label",
+        labels=None,
+        lr_pairs=None,
+    ):
+        if dist_key not in adata.layers:
+            raise KeyError(f"adata.layers['{dist_key}'] was not found.")
+        if spatial_key not in adata.obsm:
+            raise KeyError(f"adata.obsm['{spatial_key}'] was not found.")
+        if label_key not in adata.obs:
+            raise KeyError(f"adata.obs['{label_key}'] was not found.")
+
+        self.adata = adata
+        self.distance_matrix = adata.layers[dist_key]
+        self.coordinates = np.asarray(adata.obsm[spatial_key])
+        self.observation_labels = adata.obs[label_key].astype(str).to_numpy()
+        self.gene_names = adata.var_names.astype(str).to_numpy()
+        self.gene_index = {
+            gene: index for index, gene in enumerate(self.gene_names)
+        }
+
+        if labels is None:
+            self.labels = list(pd.unique(self.observation_labels))
+        else:
+            self.labels = [str(label) for label in labels]
+
+        self.label_indices = {}
+        for label in self.labels:
+            indices = np.flatnonzero(self.observation_labels == label)
+            if indices.size == 0:
+                raise ValueError(f"No observations were found for label '{label}'.")
+            self.label_indices[label] = indices
+
+        if lr_pairs is None:
+            resource = liana.resource.select_resource(resource_name=resource_name)
+            all_lr_pairs = list(zip(resource["ligand"], resource["receptor"]))
+        else:
+            all_lr_pairs = [(str(ligand), str(receptor)) for ligand, receptor in lr_pairs]
+
+        available_genes = set(self.gene_names)
+        self.lr_pairs = [
+            (ligand, receptor)
+            for ligand, receptor in all_lr_pairs
+            if ligand in available_genes and receptor in available_genes
+        ]
+        if not self.lr_pairs:
+            raise ValueError("No ligand-receptor pairs matched adata.var_names.")
+
+    def _resolve_target_pairs(self, target_pairs, include_reverse):
+        if target_pairs == "all":
+            return [
+                (sender, receiver)
+                for sender in self.labels
+                for receiver in self.labels
+                if sender != receiver
+            ]
+
+        resolved_pairs = []
+        for sender, receiver in target_pairs:
+            sender = str(sender)
+            receiver = str(receiver)
+            if sender not in self.label_indices:
+                raise ValueError(f"Unknown sender label: '{sender}'.")
+            if receiver not in self.label_indices:
+                raise ValueError(f"Unknown receiver label: '{receiver}'.")
+            resolved_pairs.append((sender, receiver))
+            if include_reverse and sender != receiver:
+                resolved_pairs.append((receiver, sender))
+
+        return list(dict.fromkeys(resolved_pairs))
+
+    def run(
+        self,
+        target_pairs="all",
+        include_reverse=True,
+        normalization=True,
+        q_um=200,
+        um_per_pixel=0.12028,
+        potential_sigma=4.0,
+        n_perms=5000,
+        p_adj_threshold=0.05,
+        seed=123,
+        n_jobs=8,
+        result_key_suffix="",
+        score_lr_source="all",
+        top_n_lr=20,
+        store_cellcell_matrices=False,
+        verbose=True,
+    ):
+        """Run CCC analysis and store direction-level results in the AnnData object."""
+        if q_um <= 0 or um_per_pixel <= 0:
+            raise ValueError("q_um and um_per_pixel must be positive.")
+        if n_perms < 0:
+            raise ValueError("n_perms must be non-negative.")
+
+        directed_pairs = self._resolve_target_pairs(target_pairs, include_reverse)
+        spatial_cutoff = q_um / um_per_pixel
+        potential_matrix = _cell_gene_distance_to_potential(
+            self.distance_matrix, sigma=potential_sigma
+        )
+        lr_pair_names = [
+            f"{ligand}-{receptor}" for ligand, receptor in self.lr_pairs
+        ]
+        ligand_indices = np.array(
+            [self.gene_index[ligand] for ligand, _ in self.lr_pairs], dtype=int
+        )
+        receptor_indices = np.array(
+            [self.gene_index[receptor] for _, receptor in self.lr_pairs], dtype=int
+        )
+        summaries = []
+
+        if verbose:
+            print(
+                f"Running CCC analysis for {len(directed_pairs)} directed label pairs "
+                f"and {len(self.lr_pairs)} ligand-receptor pairs."
+            )
+
+        for sender_label, receiver_label in directed_pairs:
+            sender_indices = self.label_indices[sender_label]
+            receiver_indices = self.label_indices[receiver_label]
+            n_sender = len(sender_indices)
+            n_receiver = len(receiver_indices)
+            pair_indices = np.concatenate([sender_indices, receiver_indices])
+            sender_positions = np.arange(n_sender)
+            receiver_positions = np.arange(n_sender, n_sender + n_receiver)
+            role_labels = np.array(
+                ["sender"] * n_sender + ["receiver"] * n_receiver
+            )
+
+            pair_coordinates = self.coordinates[pair_indices]
+            spatial_indicator = (
+                cdist(pair_coordinates, pair_coordinates, metric="euclidean")
+                <= spatial_cutoff
+            )
+            ligand_potentials = potential_matrix[np.ix_(pair_indices, ligand_indices)]
+            receptor_potentials = potential_matrix[
+                np.ix_(pair_indices, receptor_indices)
+            ]
+
+            observed = _score_ccc_lr_block(
+                sender_positions=sender_positions,
+                receiver_positions=receiver_positions,
+                spatial_indicator=spatial_indicator,
+                ligand_potentials=ligand_potentials,
+                receptor_potentials=receptor_potentials,
+                lr_pair_names=lr_pair_names,
+                return_cell_scores=True,
+                return_cellcell_matrices=store_cellcell_matrices,
+            )
+            if store_cellcell_matrices:
+                (
+                    observed_totals,
+                    sender_scores,
+                    receiver_scores,
+                    cellcell_matrices,
+                ) = observed
+            else:
+                observed_totals, sender_scores, receiver_scores = observed
+                cellcell_matrices = None
+
+            statistics = pd.DataFrame(
+                {
+                    "Ligand_Receptor": lr_pair_names,
+                    "Sender": sender_label,
+                    "Receiver": receiver_label,
+                    "Real_Sum": observed_totals,
+                },
+                index=lr_pair_names,
+            )
+
+            if n_perms > 0:
+                iterator = range(n_perms)
+                if verbose:
+                    iterator = tqdm(
+                        iterator,
+                        desc=(
+                            f"{_safe_ccc_key(sender_label)}_to_"
+                            f"{_safe_ccc_key(receiver_label)}"
+                        ),
+                    )
+                permutation_scores = Parallel(n_jobs=n_jobs, prefer="threads")(
+                    delayed(_run_ccc_permutation)(
+                        permutation_id=permutation_id,
+                        role_labels=role_labels,
+                        spatial_indicator=spatial_indicator,
+                        ligand_potentials=ligand_potentials,
+                        receptor_potentials=receptor_potentials,
+                        lr_pair_names=lr_pair_names,
+                        seed=seed,
+                    )
+                    for permutation_id in iterator
+                )
+                null_scores = np.vstack(permutation_scores)
+                p_values = (
+                    (null_scores >= observed_totals[None, :]).sum(axis=0) + 1
+                ) / (n_perms + 1)
+                statistics["P_value"] = p_values
+                statistics["P_value_min_possible"] = 1 / (n_perms + 1)
+                statistics["Null_mean"] = null_scores.mean(axis=0)
+                statistics["Null_std"] = null_scores.std(axis=0)
+                statistics["Null_median"] = np.median(null_scores, axis=0)
+                statistics["Empirical_rank"] = (
+                    observed_totals[None, :] > null_scores
+                ).mean(axis=0)
+                statistics["Enrichment"] = statistics["Real_Sum"] / (
+                    statistics["Null_mean"] + 1e-12
+                )
+                statistics["P_adj"] = multipletests(
+                    p_values, alpha=p_adj_threshold, method="fdr_bh"
+                )[1]
+                statistics = statistics.sort_values(
+                    ["P_adj", "P_value", "Real_Sum"],
+                    ascending=[True, True, False],
+                )
+                significant = statistics.loc[
+                    statistics["P_adj"] < p_adj_threshold
+                ].sort_values("Real_Sum", ascending=False)
+            else:
+                for column in (
+                    "P_value",
+                    "P_value_min_possible",
+                    "Null_mean",
+                    "Null_std",
+                    "Null_median",
+                    "Empirical_rank",
+                    "Enrichment",
+                    "P_adj",
+                ):
+                    statistics[column] = np.nan
+                statistics = statistics.sort_values("Real_Sum", ascending=False)
+                significant = statistics.iloc[0:0].copy()
+
+            direction_key = (
+                f"{_safe_ccc_key(sender_label)}_to_"
+                f"{_safe_ccc_key(receiver_label)}{result_key_suffix}"
+            )
+            all_statistics_key = f"ccc_stats_all_{direction_key}"
+            significant_statistics_key = f"ccc_stats_sig_{direction_key}"
+            self.adata.uns[all_statistics_key] = statistics
+            self.adata.uns[significant_statistics_key] = significant
+
+            if score_lr_source == "significant":
+                selected_pairs = significant.index.tolist()
+            elif score_lr_source == "all":
+                selected_pairs = statistics.index.tolist()
+            elif score_lr_source == "top":
+                selected_pairs = statistics.nlargest(
+                    top_n_lr, "Real_Sum"
+                ).index.tolist()
+            else:
+                raise ValueError(
+                    "score_lr_source must be 'significant', 'all', or 'top'."
+                )
+            selected_pairs = [
+                pair
+                for pair in selected_pairs
+                if pair in sender_scores and pair in receiver_scores
+            ]
+
+            full_sender_scores = np.zeros(self.adata.n_obs)
+            full_receiver_scores = np.zeros(self.adata.n_obs)
+            if selected_pairs:
+                combined_sender_scores = np.sum(
+                    [sender_scores[pair] for pair in selected_pairs], axis=0
+                )
+                combined_receiver_scores = np.sum(
+                    [receiver_scores[pair] for pair in selected_pairs], axis=0
+                )
+                if normalization:
+                    combined_sender_scores = _minmax_scale(combined_sender_scores)
+                    combined_receiver_scores = _minmax_scale(combined_receiver_scores)
+                full_sender_scores[sender_indices] = combined_sender_scores
+                full_receiver_scores[receiver_indices] = combined_receiver_scores
+
+            sender_score_key = f"ccc_sender_score_{direction_key}"
+            receiver_score_key = f"ccc_receiver_score_{direction_key}"
+            self.adata.obs[sender_score_key] = full_sender_scores
+            self.adata.obs[receiver_score_key] = full_receiver_scores
+            self.adata.uns[f"ccc_lr_sender_scores_{direction_key}"] = sender_scores
+            self.adata.uns[f"ccc_lr_receiver_scores_{direction_key}"] = receiver_scores
+            if store_cellcell_matrices:
+                self.adata.uns[
+                    f"ccc_cellcell_matrices_{direction_key}"
+                ] = cellcell_matrices
+
+            summaries.append(
+                {
+                    "Sender": sender_label,
+                    "Receiver": receiver_label,
+                    "Direction": f"{sender_label} -> {receiver_label}",
+                    "N_sender_cells": n_sender,
+                    "N_receiver_cells": n_receiver,
+                    "N_LR_pairs": len(statistics),
+                    "N_nominal_P_lt_0.05": int(
+                        (statistics["P_value"] < 0.05).sum()
+                    ),
+                    "N_significant_LR_pairs": len(significant),
+                    "N_LR_used_for_cell_score": len(selected_pairs),
+                    "Selected_LR_Real_Sum": float(
+                        statistics.loc[selected_pairs, "Real_Sum"].sum()
+                    ),
+                    "Min_P_value": statistics["P_value"].min(),
+                    "Min_P_adj": statistics["P_adj"].min(),
+                    "P_value_min_possible": (
+                        1 / (n_perms + 1) if n_perms > 0 else np.nan
+                    ),
+                    "Score_LR_source": score_lr_source,
+                    "Sender_score_key": sender_score_key,
+                    "Receiver_score_key": receiver_score_key,
+                    "All_stat_key": all_statistics_key,
+                    "Sig_stat_key": significant_statistics_key,
+                }
+            )
+
+            if verbose:
+                print(
+                    f"Completed {sender_label} -> {receiver_label}: "
+                    f"{len(significant)} significant ligand-receptor pairs."
+                )
+
+        summary = pd.DataFrame(summaries)
+        self.adata.uns[f"ccc_celltype_pair_summary{result_key_suffix}"] = summary
+        return summary
+
+
+def _minmax_scale(values):
+    values = np.asarray(values, dtype=float)
+    value_min = values.min()
+    value_range = values.max() - value_min
+    if value_range <= 1e-9:
+        return np.zeros_like(values)
+    return (values - value_min) / value_range
+
+
+def run_ccc_analysis(
+    adata,
+    platform="cosmx",
+    sender_label="Pathological regions",
+    receiver_label="Healthy-like regions",
+    label_key="pred_label",
+    dist_key="cell_gene_dist",
+    spatial_key="spatial",
+    resource_name="cellchatdb",
+    lr_pairs=None,
+    include_reverse=True,
+    seed=123,
+    q_um=None,
+    um_per_pixel=None,
+    potential_sigma=None,
+    n_perms=None,
+    p_adj_threshold=None,
+    n_jobs=None,
+    **run_kwargs,
+):
+    """Run bidirectional CCC analysis for pathological and healthy-like regions."""
+    parameters = get_ccc_platform_params(platform=platform, adata=adata)
+    overrides = {
+        "q_um": q_um,
+        "um_per_pixel": um_per_pixel,
+        "potential_sigma": potential_sigma,
+        "n_perms": n_perms,
+        "p_adj_threshold": p_adj_threshold,
+        "n_jobs": n_jobs,
+    }
+    parameters.update(
+        {key: value for key, value in overrides.items() if value is not None}
+    )
+    run_parameter_names = {
+        "q_um",
+        "um_per_pixel",
+        "potential_sigma",
+        "n_perms",
+        "p_adj_threshold",
+        "n_jobs",
+    }
+    run_parameters = {
+        key: value for key, value in parameters.items() if key in run_parameter_names
+    }
+
+    analysis = CellTypeCCC(
+        adata=adata,
+        resource_name=resource_name,
+        dist_key=dist_key,
+        spatial_key=spatial_key,
+        label_key=label_key,
+        labels=[receiver_label, sender_label],
+        lr_pairs=lr_pairs,
+    )
+    summary = analysis.run(
+        target_pairs=[(sender_label, receiver_label)],
+        include_reverse=include_reverse,
+        seed=seed,
+        **run_parameters,
+        **run_kwargs,
+    )
+    adata.uns["ccc_parameters"] = {
+        "platform": str(platform),
+        "sender_label": str(sender_label),
+        "receiver_label": str(receiver_label),
+        "label_key": str(label_key),
+        "dist_key": str(dist_key),
+        "spatial_key": str(spatial_key),
+        "resource_name": str(resource_name),
+        "include_reverse": bool(include_reverse),
+        "seed": int(seed),
+        **parameters,
+    }
+    return summary
 
 
 def _dist_to_potential(dist_matrix):
