@@ -1117,15 +1117,6 @@ def plot_detection_umap(
         "Healthy-like regions": "#4C78A8",
         "Pathological regions": "#E45756",
     }
-    default_celltype_palette = {
-        "adipose tissue": "#227DB5",
-        "breast glands": "#9FCCE3",
-        "connective tissue": "#3A9339",
-        "immune infiltrate": "#9ED594",
-        "others": "#A47748",
-        "cancer in situ": "#FFD966",
-        "invasive cancer": "#B34F8D",
-    }
     if label_palette is not None:
         region_palette.update(label_palette)
 
@@ -1152,10 +1143,7 @@ def plot_detection_umap(
         else:
             if celltype_palette is None:
                 fallback_colors = sns.color_palette("husl", n_colors=len(categories))
-                palette = {
-                    category: default_celltype_palette.get(category, fallback_color)
-                    for category, fallback_color in zip(categories, fallback_colors)
-                }
+                palette = dict(zip(categories, fallback_colors))
             else:
                 palette = {
                     category: celltype_palette.get(category, "#7F7F7F")
