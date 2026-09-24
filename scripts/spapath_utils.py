@@ -16,7 +16,7 @@ from statsmodels.stats.multitest import multipletests
 import matplotlib.pyplot as plt
 import seaborn as sns
 from mpl_toolkits.axes_grid1.inset_locator import inset_axes
-from matplotlib.colors import Normalize
+from matplotlib.colors import LinearSegmentedColormap, Normalize
 import matplotlib.cm as cm
 from sklearn.metrics import f1_score, accuracy_score, balanced_accuracy_score
 import liana
@@ -540,6 +540,9 @@ def search_res(
 def gene_embed_weight(X, ce_cell, adj=None, c=1.0):
     X = X.T
     if adj is None:
+        if sp.issparse(X):
+            sumW = np.asarray(X.sum(axis=1)) + 1e-8
+            return np.asarray(X @ ce_cell) / sumW
         sumW = np.sum(X, axis=1, keepdims=True) + 1e-8
         weight = X / sumW
         return weight @ ce_cell
@@ -597,6 +600,91 @@ def cell_to_gene_pdistance_torch(cell_embed, gene_embed, eta=1e-10):
     return torch.sqrt(torch.clamp(C, min=0.0) + eta)
 
 
+def build_disease_data(
+    adata_full,
+    disease_adata_all_genes,
+    disease_section,
+    embed_key="pre_embed",
+    batch_key="batch",
+    graph_key="graph",
+    gene_embed_key="gene_embed",
+    dist_key="cell_gene_dist",
+):
+    """Build an all-gene disease dataset and recalculate its co-embedding."""
+    if batch_key not in adata_full.obs:
+        raise KeyError(f"Batch column '{batch_key}' was not found in adata_full.obs.")
+    disease_mask = adata_full.obs[batch_key] == disease_section
+    if not np.any(disease_mask):
+        raise ValueError(f"No observations were found for section '{disease_section}'.")
+    disease_result = adata_full[disease_mask].copy()
+
+    if not disease_adata_all_genes.obs_names.is_unique:
+        raise ValueError("disease_adata_all_genes must have unique observation names.")
+    if not disease_result.obs_names.is_unique:
+        raise ValueError("disease_result must have unique observation names.")
+
+    missing_observations = disease_result.obs_names.difference(
+        disease_adata_all_genes.obs_names
+    )
+    if len(missing_observations) > 0:
+        raise ValueError(
+            f"{len(missing_observations)} observations in disease_result are missing "
+            "from disease_adata_all_genes."
+        )
+
+    disease_data = disease_adata_all_genes[disease_result.obs_names].copy()
+    aligned_result = disease_result[disease_data.obs_names]
+    disease_data.obs = aligned_result.obs.copy()
+
+    for key in list(disease_data.obsm.keys()):
+        del disease_data.obsm[key]
+    for key, value in aligned_result.obsm.items():
+        disease_data.obsm[key] = value.copy()
+
+    if embed_key not in disease_data.obsm:
+        raise KeyError(f"Embedding '{embed_key}' was not found in disease_result.obsm.")
+
+    if graph_key in aligned_result.obsp:
+        graph = aligned_result.obsp[graph_key].copy()
+    else:
+        if batch_key not in aligned_result.obs:
+            raise KeyError(
+                f"Batch column '{batch_key}' was not found in disease_result.obs."
+            )
+        section_ids = aligned_result.obs[batch_key].unique()
+        if len(section_ids) != 1:
+            raise ValueError("disease_result must contain exactly one section.")
+        stored_graph_key = f"{graph_key}_{section_ids[0]}"
+        if stored_graph_key not in aligned_result.uns:
+            raise KeyError(
+                f"Graph '{graph_key}' was not found in disease_result.obsp, and "
+                f"'{stored_graph_key}' was not found in disease_result.uns."
+            )
+        graph = aligned_result.uns[stored_graph_key].copy()
+
+    if graph.shape != (disease_data.n_obs, disease_data.n_obs):
+        raise ValueError(
+            f"Graph shape {graph.shape} does not match the {disease_data.n_obs} "
+            "observations in disease_data."
+        )
+    disease_data.obsp[graph_key] = graph
+
+    expression = disease_data.X
+    if sp.issparse(expression):
+        expression = expression.toarray()
+    else:
+        expression = np.asarray(expression)
+    cell_embedding = np.asarray(disease_data.obsm[embed_key])
+    dense_graph = graph.toarray() if sp.issparse(graph) else np.asarray(graph)
+    gene_embedding = gene_embed_weight(expression, cell_embedding, dense_graph)
+    disease_data.uns[gene_embed_key] = gene_embedding
+    disease_data.layers[dist_key] = cell_to_gene_pdistance(
+        cell_embedding, disease_data.uns[gene_embed_key]
+    ).astype(np.float32)
+
+    return disease_data
+
+
 def select_sig_genes(
     adata,
     dist_key="dist",
@@ -622,20 +710,15 @@ def select_sig_genes(
     distce_data = adata[:, genes_use].layers[dist_key]
 
     if sp.issparse(expr_data):
-        expr_data = expr_data.toarray()
+        expr_data = expr_data.tocsr()
     if sp.issparse(distce_data):
         distce_data = distce_data.toarray()
-
-    n_cells = adata.n_obs
-    expr_all = (expr_data > 0).sum(axis=0)
 
     ref_sig_list = {}
 
     for label in cell_IDs:
         idx = np.where(cell_label_vec == label)[0]
-        n_idx = len(idx)
-
-        expr_prop = (expr_data[idx, :] > 0).mean(axis=0)
+        expr_prop = np.asarray((expr_data[idx, :] > 0).mean(axis=0)).ravel()
         distce_vals = distce_data[idx, :].mean(axis=0)
 
         mask = expr_prop > expr_prop_cutoff
@@ -665,6 +748,127 @@ def select_sig_genes(
         }
 
     return ref_sig_list
+
+
+def calculate_signature_genes(
+    adata,
+    target_label="Pathological regions",
+    dist_key="cell_gene_dist",
+    label_key="pred_label",
+    topk=100,
+    n_print=10,
+    **selection_kwargs,
+):
+    """Calculate signature genes for one label and print the leading genes."""
+    if n_print < 0:
+        raise ValueError("n_print must be non-negative.")
+
+    signature_results = select_sig_genes(
+        adata=adata,
+        dist_key=dist_key,
+        label_key=label_key,
+        topk=topk,
+        **selection_kwargs,
+    )
+    if target_label not in signature_results:
+        available_labels = ", ".join(map(str, signature_results))
+        raise KeyError(
+            f"Label '{target_label}' was not found. Available labels: "
+            f"{available_labels}."
+        )
+
+    signature_genes = signature_results[target_label]["genes"]
+    n_display = min(n_print, len(signature_genes))
+    signature_table = pd.DataFrame(
+        {
+            "rank": np.arange(1, n_display + 1),
+            "gene": signature_genes[:n_display],
+        }
+    )
+    print(f"Top {n_display} signature genes for {target_label}:")
+    print(signature_table.to_string(index=False))
+    return signature_genes
+
+
+def plot_gene_expression(
+    adata,
+    genes,
+    spatial_key="spatial",
+    n_columns=3,
+    point_size=25,
+    cmap=None,
+    flip_y=True,
+    save=None,
+    dpi=150,
+    show=True,
+):
+    """Plot spatial expression for selected genes."""
+    if spatial_key not in adata.obsm:
+        raise KeyError(
+            f"Spatial coordinates '{spatial_key}' were not found in adata.obsm."
+        )
+    if not genes:
+        raise ValueError("At least one gene must be provided.")
+    if n_columns <= 0:
+        raise ValueError("n_columns must be positive.")
+
+    missing_genes = [gene for gene in genes if gene not in adata.var_names]
+    if missing_genes:
+        raise KeyError(f"Genes not found in adata.var_names: {', '.join(missing_genes)}")
+
+    coordinates = np.asarray(adata.obsm[spatial_key]).copy()
+    if coordinates.ndim != 2 or coordinates.shape[1] < 2:
+        raise ValueError(f"'{spatial_key}' must contain at least two coordinate columns.")
+    if flip_y:
+        coordinates[:, 1] *= -1
+
+    if cmap is None:
+        cmap = LinearSegmentedColormap.from_list(
+            "signature_expression", ["#636fa4", "#e8cbc0", "#ff7e5f"]
+        )
+
+    n_columns = min(n_columns, len(genes))
+    n_rows = int(np.ceil(len(genes) / n_columns))
+    figure, axes = plt.subplots(
+        n_rows,
+        n_columns,
+        figsize=(n_columns * 3, n_rows * 2.5),
+        squeeze=False,
+    )
+    axes = axes.ravel()
+
+    for axis, gene in zip(axes, genes):
+        expression = adata[:, gene].X
+        if sp.issparse(expression):
+            expression = expression.toarray()
+        expression = np.asarray(expression).ravel()
+
+        scatter = axis.scatter(
+            coordinates[:, 0],
+            coordinates[:, 1],
+            c=expression,
+            cmap=cmap,
+            s=point_size,
+            edgecolors="none",
+            rasterized=True,
+        )
+        axis.set_title(gene, fontsize=12, fontstyle="italic")
+        axis.set_aspect("equal", adjustable="box")
+        axis.set_axis_off()
+        figure.colorbar(scatter, ax=axis, shrink=0.8, pad=0.02)
+
+    for axis in axes[len(genes) :]:
+        axis.set_visible(False)
+
+    figure.tight_layout()
+    if save is not None:
+        figure.savefig(save, dpi=dpi, bbox_inches="tight")
+        print(f"Gene-expression plot was saved to {save}.")
+    if show:
+        plt.show()
+        return None
+
+    return figure
 
 
 def self_compute_gene_pvalue(A_dict, background_genes):
@@ -913,15 +1117,23 @@ def plot_detection_umap(
         "Healthy-like regions": "#4C78A8",
         "Pathological regions": "#E45756",
     }
+    default_celltype_palette = {
+        "adipose tissue": "#227DB5",
+        "breast glands": "#9FCCE3",
+        "connective tissue": "#3A9339",
+        "immune infiltrate": "#9ED594",
+        "others": "#A47748",
+        "cancer in situ": "#FFD966",
+        "invasive cancer": "#B34F8D",
+    }
     if label_palette is not None:
         region_palette.update(label_palette)
 
-    category_counts = [plot_adata.obs[key].astype(str).nunique() for key in color_keys]
-    right_margin = 0.62 if max(category_counts) > 12 else 0.74
+    right_margin = 0.82 if len(color_keys) > 1 else 0.72
     figure, axes = plt.subplots(
-        len(color_keys),
         1,
-        figsize=(9.5, 4.8 * len(color_keys)),
+        len(color_keys),
+        figsize=(5.0 * len(color_keys), 4.2),
         squeeze=False,
     )
     axes = axes.ravel()
@@ -939,9 +1151,11 @@ def plot_detection_umap(
             panel_title = "Predicted regions"
         else:
             if celltype_palette is None:
-                palette_name = "tab20" if len(categories) <= 20 else "husl"
-                colors = sns.color_palette(palette_name, n_colors=len(categories))
-                palette = dict(zip(categories, colors))
+                fallback_colors = sns.color_palette("husl", n_colors=len(categories))
+                palette = {
+                    category: default_celltype_palette.get(category, fallback_color)
+                    for category, fallback_color in zip(categories, fallback_colors)
+                }
             else:
                 palette = {
                     category: celltype_palette.get(category, "#7F7F7F")
@@ -964,6 +1178,7 @@ def plot_detection_umap(
         axis.set_title(panel_title, fontsize=14, pad=10)
         axis.set_xlabel("UMAP 1", fontsize=10)
         axis.set_ylabel("UMAP 2", fontsize=10)
+        axis.set_box_aspect(1)
         axis.set_xticks([])
         axis.set_yticks([])
         for spine in axis.spines.values():
@@ -979,7 +1194,7 @@ def plot_detection_umap(
             borderaxespad=0.0,
         )
 
-    figure.subplots_adjust(right=right_margin, hspace=0.35)
+    figure.subplots_adjust(right=right_margin, wspace=0.9)
 
     if save is not None:
         figure.savefig(save, dpi=dpi, bbox_inches="tight")
