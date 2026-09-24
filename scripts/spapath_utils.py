@@ -1749,12 +1749,13 @@ def _resolve_he_point_size(
     return max(diameter_points**2, 1.0)
 
 
-def _format_he_axis(axis, cropped_image):
+def _format_he_axis(axis, cropped_image, fill_figure=True):
     axis.set_xlim(0, cropped_image.shape[1])
     axis.set_ylim(cropped_image.shape[0], 0)
     axis.set_axis_off()
     axis.margins(0)
-    axis.set_position([0, 0, 1, 1])
+    if fill_figure:
+        axis.set_position([0, 0, 1, 1])
 
 
 def plot_prediction_on_he(
@@ -1776,10 +1777,14 @@ def plot_prediction_on_he(
     save=None,
     dpi=300,
     show=True,
+    ground_truth_key=None,
+    ground_truth_palette=None,
 ):
-    """Overlay predicted region labels on a cropped H&E tissue image."""
+    """Overlay predictions and optional ground truth on H&E; figsize is per panel."""
     if label_key not in adata.obs:
         raise KeyError(f"adata.obs['{label_key}'] was not found.")
+    if ground_truth_key is not None and ground_truth_key not in adata.obs:
+        raise KeyError(f"adata.obs['{ground_truth_key}'] was not found.")
     plot_adata, cropped_image, cropped_coordinates = _prepare_he_overlay(
         adata=adata,
         image_path=image_path,
@@ -1789,16 +1794,15 @@ def plot_prediction_on_he(
         coordinate_scale=coordinate_scale,
         crop_margin=crop_margin,
     )
-    labels = plot_adata.obs[label_key].astype(str)
-    categories = sorted(labels.unique(), key=_label_sort_key)
-
     default_palette = {
         "Pathological regions": "#B6473F",
         "Healthy-like regions": "#6DBBD1",
     }
     if label_palette is not None:
         default_palette.update(label_palette)
-    colors = labels.map(default_palette).fillna("#7F7F7F").to_numpy()
+    panels = [(label_key, default_palette, "SpaPath")]
+    if ground_truth_key is not None:
+        panels.append((ground_truth_key, ground_truth_palette or {}, "Ground Truth"))
     resolved_point_size = _resolve_he_point_size(
         coordinates=cropped_coordinates,
         cropped_image_shape=cropped_image.shape,
@@ -1807,40 +1811,59 @@ def plot_prediction_on_he(
         point_scale=point_scale,
     )
 
-    figure, axis = plt.subplots(figsize=figsize)
-    axis.imshow(cropped_image, alpha=image_alpha)
-    axis.scatter(
-        cropped_coordinates[:, 0],
-        cropped_coordinates[:, 1],
-        c=colors,
-        s=resolved_point_size,
-        alpha=point_alpha,
-        edgecolors="none",
-        rasterized=True,
+    figure, axes = plt.subplots(
+        1, len(panels), figsize=(figsize[0] * len(panels), figsize[1]), squeeze=False
     )
-    _format_he_axis(axis, cropped_image)
+    if len(panels) > 1:
+        figure.subplots_adjust(left=0, right=1, bottom=0, top=0.9, wspace=0.12)
 
-    if show_legend:
-        legend_handles = [
-            plt.Line2D(
-                [0],
-                [0],
-                marker="o",
-                linestyle="none",
-                markerfacecolor=default_palette.get(category, "#7F7F7F"),
-                markeredgecolor="none",
-                markersize=5,
-                label=category,
-            )
-            for category in categories
-        ]
-        axis.legend(
-            handles=legend_handles,
-            loc="lower left",
-            frameon=True,
-            framealpha=0.8,
-            fontsize=8,
+    for axis, (key, palette, title) in zip(axes.ravel(), panels):
+        labels = plot_adata.obs[key].astype(str)
+        categories = sorted(labels.unique(), key=_label_sort_key)
+        colors = labels.map(palette).fillna("#7F7F7F").to_numpy()
+        axis.imshow(cropped_image, alpha=image_alpha)
+        axis.scatter(
+            cropped_coordinates[:, 0],
+            cropped_coordinates[:, 1],
+            c=colors,
+            s=resolved_point_size,
+            alpha=point_alpha,
+            edgecolors="none",
+            rasterized=True,
         )
+        _format_he_axis(axis, cropped_image, fill_figure=len(panels) == 1)
+        if len(panels) > 1:
+            axis.set_title(title, fontsize=12, pad=8)
+
+        if show_legend:
+            legend_handles = [
+                plt.Line2D(
+                    [0],
+                    [0],
+                    marker="o",
+                    linestyle="none",
+                    markerfacecolor=palette.get(category, "#7F7F7F"),
+                    markeredgecolor="none",
+                    markersize=5,
+                    label=category,
+                )
+                for category in categories
+            ]
+            legend_options = (
+                {
+                    "loc": "upper center",
+                    "bbox_to_anchor": (0.5, -0.02),
+                    "ncol": 2,
+                    "frameon": False,
+                }
+                if len(panels) > 1
+                else {"loc": "lower left", "frameon": True, "framealpha": 0.8}
+            )
+            axis.legend(
+                handles=legend_handles,
+                fontsize=8,
+                **legend_options,
+            )
 
     if save is not None:
         figure.savefig(
