@@ -24,7 +24,7 @@ The notebooks import SpaPath directly from `scripts/`; no separate package insta
 
 See the [documentation](https://spapath.readthedocs.io/en/latest/) and [tutorials](https://spapath.readthedocs.io/en/latest/tutorials.html) for breast cancer (BC), non-small-cell lung cancer (NSCLC), oral squamous cell carcinoma (OSCC), multiple myeloma (MM), and Crohn's disease (CD).
 
-Place example inputs in `data/<dataset>/` and open the corresponding notebook in `notebook/` with Jupyter. Results are saved under `outputs/<dataset>/`. **Example data are not included; public download links are pending.**
+Download the [example data from Google Drive](https://drive.google.com/drive/folders/13NJaAKoUTo84DH05KLuG1zxdfcZso5b4?usp=sharing) and place each dataset's files in `data/<dataset>/` (for example, `data/BC/H1.h5ad`). Open the corresponding notebook in `notebook/` with Jupyter. Results are saved under `outputs/<dataset>/`. The example data are not included in this repository.
 
 ## Support and license
 
