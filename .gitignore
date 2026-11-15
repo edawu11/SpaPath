@@ -33,6 +33,7 @@ Thumbs.db
 
 # Local data and analysis output
 /data
+/data.zip
 /outputs/
 
 # Private manuscript correspondence and backups

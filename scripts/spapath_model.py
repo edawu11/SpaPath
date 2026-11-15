@@ -315,8 +315,6 @@ class Model:
         self.use_dec_finetune = bool(use_dec_finetune)
         self.verbose = verbose
 
-        self.n_ST = sum(_is_st(t) for t in self.data_type)
-
         self.update_interval = update_interval
         self.coef_kid = coef_kid
         self.coef_recon = coef_recon
@@ -349,17 +347,19 @@ class Model:
             adata_batch = self.adata_full[
                 self.adata_full.obs[self.batch_key] == bid
             ].copy()
+            graph_cos_key = f"graph_cos_{bid}"
+            if graph_cos_key not in self.adata_full.uns:
+                raise KeyError(
+                    f"{graph_cos_key} not found in adata_full.uns; "
+                    "run spapath_utils.build_graph_GAT_plus() for all data types "
+                    "before creating Model."
+                )
+            adata_batch.obsp["graph_cos"] = self.adata_full.uns[graph_cos_key].copy()
             if _is_st(self.data_type[i]):
                 graph_key = f"graph_{bid}"
-                graph_cos_key = f"graph_cos_{bid}"
                 if graph_key not in self.adata_full.uns:
                     raise KeyError(f"{graph_key} not found in adata_full.uns")
-                if graph_cos_key not in self.adata_full.uns:
-                    raise KeyError(f"{graph_cos_key} not found in adata_full.uns")
                 adata_batch.obsp["graph"] = self.adata_full.uns[graph_key].copy()
-                adata_batch.obsp["graph_cos"] = self.adata_full.uns[
-                    graph_cos_key
-                ].copy()
             adata_batch.uns = {}
             self.batch_list.append(adata_batch)
 
@@ -393,18 +393,17 @@ class Model:
                     torch.from_numpy(graph).float().to(self.device)
                 )
 
-                graph_cos = self.batch_list[i].obsp["graph_cos"]
-                if sp.issparse(graph_cos):
-                    graph_cos = graph_cos.toarray()
-                else:
-                    graph_cos = np.asarray(graph_cos)
-                self.graph_cos_dict[i] = (
-                    torch.from_numpy(graph_cos).float().to(self.device)
-                )
-
             else:
                 self.adj_matrix_dict[i] = None
-                self.graph_cos_dict[i] = None
+
+            graph_cos = self.batch_list[i].obsp["graph_cos"]
+            if sp.issparse(graph_cos):
+                graph_cos = graph_cos.toarray()
+            else:
+                graph_cos = np.asarray(graph_cos)
+            self.graph_cos_dict[i] = (
+                torch.from_numpy(graph_cos).float().to(self.device)
+            )
 
     def initial_embedding(self):
         self.netmodel = {}
@@ -1094,19 +1093,15 @@ class Model:
             for i in range(self.n_slices):
                 diff = self.node_feats_dict[i] - X_recons[i]
                 recon_loss += torch.mean(torch.sqrt(torch.sum(diff**2, dim=1) + 1e-8))
-                if _is_st(self.data_type[i]):
-                    Ss_norm_dict[i] = F.normalize(Ss[i], p=2, dim=1, eps=1e-8)
-                    graph_cos = self.graph_cos_dict[i].to(self.device)
-                    mat_diff = (
-                        torch.matmul(Ss_norm_dict[i], Ss_norm_dict[i].T) - graph_cos
-                    )
-                    geom_loss += torch.mean(torch.sum(mat_diff**2, dim=1))
+                Ss_norm_dict[i] = F.normalize(Ss[i], p=2, dim=1, eps=1e-8)
+                graph_cos = self.graph_cos_dict[i].to(self.device)
+                mat_diff = (
+                    torch.matmul(Ss_norm_dict[i], Ss_norm_dict[i].T) - graph_cos
+                )
+                geom_loss += torch.mean(torch.sum(mat_diff**2, dim=1))
 
             recon_loss = recon_loss / self.n_slices
-            if self.n_ST > 0:
-                geom_loss = geom_loss / self.n_ST
-            else:
-                geom_loss = torch.tensor(0.0, device=self.device)
+            geom_loss = geom_loss / self.n_slices
 
             n_out = Ss[tar_index][inter_out_list[0], :].shape[0]
             if n_out > 0:

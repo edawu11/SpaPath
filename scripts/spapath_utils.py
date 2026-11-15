@@ -156,21 +156,30 @@ def preprocess(
 
 
 def build_graph_GAT_plus(adata_full, adata_type_map: dict, K=8, img_threshold=0.0):
+    """Build feature cosine targets for all modalities and spatial graphs for ST."""
     print("Start building graphs...")
 
     batch_ids = adata_full.obs["batch"].unique()
 
     for bid in batch_ids:
-        current_type = adata_type_map[bid]
+        current_type = str(adata_type_map[bid]).strip().upper()
         mask = adata_full.obs["batch"] == bid
         adata_st = adata_full[mask]
         n_cells = adata_st.shape[0]
 
-        if current_type in ["sc", "scATAC"]:
+        # Preserve feature geometry for every modality, independently of spatial graphs.
+        try:
+            pair_dist_cos = pairwise_distances(adata_st.X, metric="cosine")
+            adata_full.uns[f"graph_cos_{bid}"] = 1 - pair_dist_cos
+            del pair_dist_cos
+        except MemoryError as exc:
+            raise MemoryError(
+                f"Cannot compute feature cosine matrix for batch {bid} ({current_type}); "
+                "geom_loss requires the real similarity matrix."
+            ) from exc
+
+        if current_type not in {"ST", "ST_WITH_HE"}:
             adata_full.uns[f"graph_{bid}"] = sp.eye(n_cells, dtype=int, format="csr")
-            adata_full.uns[f"graph_cos_{bid}"] = sp.eye(
-                n_cells, dtype=float, format="csr"
-            )
             print(f"Skipping spatial graph for batch {bid} ({current_type})")
             continue
 
@@ -194,7 +203,7 @@ def build_graph_GAT_plus(adata_full, adata_type_map: dict, K=8, img_threshold=0.
             row_indices_list = np.repeat(np.arange(n_cells), K + 1)
             col_indices_list = knn_indices.flatten()
 
-        elif current_type == "ST_with_HE":
+        elif current_type == "ST_WITH_HE":
             if "image_embedding" not in adata_st.obsm:
                 raise ValueError(
                     f"Batch {bid} is 'ST_with_HE' but .obsm['image_embedding'] is missing."
@@ -230,15 +239,6 @@ def build_graph_GAT_plus(adata_full, adata_type_map: dict, K=8, img_threshold=0.
 
         avg_neighbors = G_sparse.sum(axis=1).mean()
         print(f"  Average neighbors for Slice {bid}: {avg_neighbors-1:.2f}")
-
-        try:
-            pair_dist_cos = pairwise_distances(adata_st.X, metric="cosine")
-            adata_full.uns[f"graph_cos_{bid}"] = 1 - pair_dist_cos
-        except MemoryError:
-            print(
-                f"  Warning: MemoryError when computing cosine matrix for batch {bid}. Using identity."
-            )
-            adata_full.uns[f"graph_cos_{bid}"] = np.eye(n_cells, dtype=float)
 
     return adata_full
 
@@ -1435,6 +1435,15 @@ def detection(
     threshold=0.05,
     strategy="cluster",
 ):
+    """Detect disease regions using ``cluster`` (default) or ``individual``.
+
+    Cluster mode splits the target into two groups and labels an entire group
+    when its fraction of observations with any reference neighbor is at most
+    ``threshold``. If neither group qualifies, it falls back to individual mode,
+    which labels target observations with no reference neighbors.
+    """
+    if strategy not in {"cluster", "individual"}:
+        raise ValueError("strategy must be 'cluster' or 'individual'.")
 
     cond_section = section_ids[-1]
     adata_all = adata.copy()
@@ -1443,8 +1452,7 @@ def detection(
     adata_all.uns["result"] = {}
     normal_mask = adata_all.obs[batch_key].isin(section_ids[:-1])
     cond_mask = adata_all.obs[batch_key] == section_ids[-1]
-    adata_normal = adata_all[normal_mask]
-    adata_cond = adata_all[cond_mask]
+    adata_cond = adata_all[cond_mask].copy()
 
     X_all = adata_all.obsm[embed]
     nbrs = NearestNeighbors(n_neighbors=neighbors + 1).fit(X_all)
@@ -1485,7 +1493,7 @@ def detection(
 
         for idx in cond_indices:
             neighbor_indices = indices_all[idx][1:]
-            has_normal = np.any(normal_mask[neighbor_indices])
+            has_normal = np.any(is_normal_all[neighbor_indices])
             pad_flags.append(int(not has_normal))
 
         pad_cells = cond_indices[np.array(pad_flags) == 1]
