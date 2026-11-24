@@ -557,7 +557,7 @@ class Model:
                     tri_indx = np.triu_indices_from(score_mat, k=1)
                     upper_tri_values = score_mat[tri_indx]
 
-                    if np.any(upper_tri_values <= 0.05):
+                    if np.any(upper_tri_values < 0.05):
                         min_idx = np.argmin(upper_tri_values)
                         cluster_idx_i = tri_indx[0][min_idx]
                         cluster_idx_j = tri_indx[1][min_idx]
@@ -998,7 +998,7 @@ class Model:
                     if len(eligible_ref_row_idx) > 0:
                         eligible_score_mat = score_mat[eligible_ref_row_idx, :]
                         far_candidate_idx = np.where(
-                            np.min(eligible_score_mat, axis=0) > 0.05
+                            np.min(eligible_score_mat, axis=0) >= 0.05
                         )[0]
                         far_candidates_i = set(
                             tar_label_order[t_idx] for t_idx in far_candidate_idx

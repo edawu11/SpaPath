@@ -25,7 +25,8 @@ Keep the disease sample last during preprocessing and detection. Pass `label_cor
 | `run_signature_enrichment` | Perform GO/Hallmark enrichment through Enrichr. |
 | `run_ccc_analysis` | Analyze spatial cell–cell communication; both directions are included by default. |
 | `calculate_tc_le_enrichment` | Calculate TC, LE, and TC-to-LE scores. |
+| `calculate_gene_set_scores` | Score selected observations by negative mean cell–gene distances from `.layers["dist"]`. |
 | `plot_detection_umap` | Show region predictions and optional cell-type labels. |
 | `plot_prediction_on_he` / `plot_score_on_he` | Overlay predicted regions or continuous scores on H&E. |
 | `plot_gene_expression` | Plot spatial expression of selected genes. |
-| `plot_enrichment_bubble` / `plot_tc_le_violin` | Display enrichment results. |
+| `plot_enrichment_bubble` / `plot_tc_le_violin` | Plot enrichment results or compare TC-to-LE scores across tissue classes. |

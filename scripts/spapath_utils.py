@@ -696,8 +696,9 @@ def plot_enrichment_bubble(
     save=None,
     dpi=300,
     show=True,
+    label_width=42,
 ):
-    """Plot significant GO and Hallmark enrichment terms as a bubble chart."""
+    """Plot GO and Hallmark enrichment terms, wrapping labels at label_width."""
     from matplotlib.patches import Patch
 
     required_columns = {
@@ -740,7 +741,7 @@ def plot_enrichment_bubble(
     else:
         display_terms = plot_data["Term"].map(_extract_enrichment_term_name)
     plot_data["Label"] = display_terms.map(
-        lambda term: _wrap_enrichment_label(term, width=42)
+        lambda term: _wrap_enrichment_label(term, width=label_width)
     )
     plot_data["neglog10_adjP"] = -np.log10(
         plot_data["Adjusted P-value"].clip(lower=1e-300)
@@ -1011,6 +1012,33 @@ def load_tc_le_gene_sets(
     return gene_sets
 
 
+def calculate_gene_set_scores(adata, gene_sets, mask, min_genes=5):
+    """Score selected observations by the negative mean distance to each gene set."""
+    if min_genes <= 0:
+        raise ValueError("min_genes must be positive.")
+
+    dist = adata.layers["dist"]
+    gene_index = pd.Index(adata.var_names)
+    mask = np.asarray(mask)
+    scores = pd.DataFrame(index=adata.obs_names[mask])
+
+    for name, genes in gene_sets.items():
+        unique_genes = list(dict.fromkeys(genes))
+        valid_genes = [gene for gene in unique_genes if gene in gene_index]
+        if len(valid_genes) < min_genes:
+            raise ValueError(
+                f"{name}: only {len(valid_genes)} genes found "
+                f"(minimum required: {min_genes})."
+            )
+
+        indices = gene_index.get_indexer(valid_genes)
+        mean_dist = dist[:, indices][mask].mean(axis=1)
+        scores[name] = -np.asarray(mean_dist).ravel()
+        print(f"  {name}: {len(valid_genes)}/{len(unique_genes)} genes used")
+
+    return scores
+
+
 def calculate_distance_enrichment(
     adata,
     gene_sets,
@@ -1218,6 +1246,7 @@ def plot_tc_le_violin(
     save=None,
     dpi=300,
     show=True,
+    score_label="TC-to-LE enrichment score",
 ):
     """Plot TC-to-LE scores by ground-truth pathological tissue class."""
     required_columns = {
@@ -1335,7 +1364,7 @@ def plot_tc_le_violin(
 
     axis.set_ylim(score_min - score_range * 0.10, score_max + score_range * 0.30)
     axis.set_xlabel("")
-    axis.set_ylabel("TC-to-LE enrichment score", fontsize=11)
+    axis.set_ylabel(score_label, fontsize=11)
     axis.set_xticks(
         range(len(group_order)),
         labels=[group.capitalize() for group in group_order],
@@ -1438,7 +1467,7 @@ def detection(
     """Detect disease regions using ``cluster`` (default) or ``individual``.
 
     Cluster mode splits the target into two groups and labels an entire group
-    when its fraction of observations with any reference neighbor is at most
+    when its fraction of observations with any reference neighbor is below
     ``threshold``. If neither group qualifies, it falls back to individual mode,
     which labels target observations with no reference neighbors.
     """
@@ -1479,15 +1508,15 @@ def detection(
                 has_normal = np.any(is_normal_all[neighbor_indices])
                 hit_flags.append(int(has_normal))
             ratios[binary_label] = np.mean(hit_flags)
-            if ratios[binary_label] <= threshold:
+            if ratios[binary_label] < threshold:
                 cond_binary_cells = adata_cluster.obs_names
                 adata_all.obs.loc[cond_binary_cells, "pred_label"] = label_core
         print(f"Detection completed with cluster reference-overlap ratios: {ratios}.")
-        all_above = all(v > threshold for v in ratios.values())
+        all_at_or_above = all(v >= threshold for v in ratios.values())
     else:
-        all_above = True
+        all_at_or_above = True
 
-    if all_above or strategy == "individual":
+    if all_at_or_above or strategy == "individual":
         cond_indices = np.where(adata_all.obs[batch_key] == section_ids[-1])[0]
         pad_flags = []
 
@@ -2070,7 +2099,7 @@ def subclustering(
             tri_indx = np.triu_indices_from(score_mat, k=1)
             upper_tri_values = score_mat[tri_indx]
 
-            while any(upper_tri_values <= 0.05):
+            while any(upper_tri_values < 0.05):
                 min_idx = np.argmin(upper_tri_values)
                 x = tri_indx[0][min_idx]
                 y = tri_indx[1][min_idx]

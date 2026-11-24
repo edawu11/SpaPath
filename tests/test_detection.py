@@ -55,10 +55,10 @@ class DetectionTests(unittest.TestCase):
         self.assert_predictions(result, [False] * 3 + [True] * 3)
         self.assertNotIn("pred_label", data.obs)
 
-    def test_cluster_threshold_includes_entire_group_at_boundary(self):
+    def test_cluster_threshold_excludes_group_at_boundary(self):
         with patch.object(spapath_utils, "search_res", return_value=np.array([0] * 3 + [1] * 3)):
             result = self.detect(self.make_data(), strategy="cluster", threshold=1 / 3)
-        self.assert_predictions(result, [True] * 6)
+        self.assert_predictions(result, [False] * 3 + [True] * 3)
 
     def test_individual_skips_clustering(self):
         with patch.object(spapath_utils, "search_res", side_effect=AssertionError("Must not cluster")):
@@ -67,11 +67,13 @@ class DetectionTests(unittest.TestCase):
 
     def test_cluster_falls_back_when_both_groups_overlap_reference(self):
         data = self.make_data(overlap_both=True)
-        with patch.object(spapath_utils, "search_res", return_value=np.array([0] * 3 + [1] * 3)):
-            cluster = self.detect(data, strategy="cluster")
         individual = self.detect(data, strategy="individual")
-        self.assert_predictions(cluster, [False, True, True, False, True, True])
-        pd.testing.assert_series_equal(cluster.obs["pred_label"], individual.obs["pred_label"])
+        for threshold in (0.05, 1 / 3):
+            with self.subTest(threshold=threshold):
+                with patch.object(spapath_utils, "search_res", return_value=np.array([0] * 3 + [1] * 3)):
+                    cluster = self.detect(data, strategy="cluster", threshold=threshold)
+                self.assert_predictions(cluster, [False, True, True, False, True, True])
+                pd.testing.assert_series_equal(cluster.obs["pred_label"], individual.obs["pred_label"])
 
     def test_invalid_strategy_is_rejected(self):
         with self.assertRaisesRegex(ValueError, "cluster.*individual"):
